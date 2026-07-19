@@ -1,0 +1,687 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>lite-crdt — live convergence</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Space+Mono:wght@400;700&display=swap"
+          rel="stylesheet">
+
+    <!-- Direct import from source. No bundle, no inline library code.
+         Run `npm install` once, then serve this folder over http (e.g. `npx serve`). -->
+    <script type="importmap">
+{
+  "imports": {
+    "@zakkster/lite-signal": "../node_modules/@zakkster/lite-signal/Signal.js",
+    "@zakkster/lite-store": "../node_modules/@zakkster/lite-store/Store.js",
+    "@zakkster/lite-crdt": "../CRDT.js"
+  }
+}
+
+    </script>
+
+    <style>
+        :root {
+            --bg: #0b0c0e;
+            --panel: #131519;
+            --panel-2: #0e1013;
+            --line: rgba(255, 255, 255, .07);
+            --line-strong: rgba(255, 255, 255, .16);
+            --text: #d8d6d2;
+            --dim: #8b8d94;
+            --faint: #555960;
+            --green: #5fe39f;
+            --green-dim: #2b7a52;
+            --cyan: #7dd3fc;
+            --amber: #f5b942;
+            --magenta: #e879a8;
+            --red: #f87171;
+            --a: var(--cyan);
+            --b: var(--magenta);
+        }
+
+        * {
+            box-sizing: border-box
+        }
+
+        html, body {
+            margin: 0
+        }
+
+        body {
+            background: var(--bg);
+            color: var(--text);
+            font-family: 'JetBrains Mono', ui-monospace, monospace;
+            font-size: 13px;
+            line-height: 1.5;
+            padding: 28px clamp(14px, 4vw, 48px) 60px;
+            background-image: radial-gradient(900px 380px at 50% -8%, rgba(125, 211, 252, .06), transparent 70%);
+        }
+
+        h1, h2 {
+            font-family: 'Space Mono', 'JetBrains Mono', monospace;
+            font-weight: 700;
+            margin: 0
+        }
+
+        header.top h1 {
+            font-size: 22px;
+            letter-spacing: .5px
+        }
+
+        header.top h1 .sig {
+            color: var(--green)
+        }
+
+        .tagline {
+            color: var(--dim);
+            margin: 6px 0 0;
+            max-width: 70ch
+        }
+
+        .tagline b {
+            color: var(--text);
+            font-weight: 500
+        }
+
+        .status {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 14px;
+            align-items: center;
+            margin: 22px 0 18px
+        }
+
+        .badge {
+            border: 1px solid var(--line-strong);
+            border-radius: 8px;
+            padding: 10px 16px;
+            display: flex;
+            align-items: center;
+            gap: 11px;
+            min-width: 280px;
+            background: var(--panel-2);
+            transition: border-color .25s, box-shadow .25s, background .25s;
+        }
+
+        .badge .led {
+            width: 11px;
+            height: 11px;
+            border-radius: 50%;
+            background: var(--faint);
+            box-shadow: 0 0 0 0 transparent;
+            transition: all .25s
+        }
+
+        .badge .label {
+            font-family: 'Space Mono', monospace;
+            font-weight: 700;
+            letter-spacing: .5px
+        }
+
+        .badge .sub {
+            color: var(--dim);
+            font-size: 12px
+        }
+
+        .badge.ok {
+            border-color: var(--green-dim);
+            background: linear-gradient(0deg, rgba(95, 227, 159, .05), transparent)
+        }
+
+        .badge.ok .led {
+            background: var(--green);
+            box-shadow: 0 0 14px 1px rgba(95, 227, 159, .7)
+        }
+
+        .badge.ok .label {
+            color: var(--green)
+        }
+
+        .badge.div .led {
+            background: var(--amber);
+            box-shadow: 0 0 12px 0 rgba(245, 185, 66, .55)
+        }
+
+        .badge.div .label {
+            color: var(--amber)
+        }
+
+        @keyframes pulse {
+            0% {
+                box-shadow: 0 0 0 0 rgba(95, 227, 159, .55)
+            }
+            100% {
+                box-shadow: 0 0 0 16px rgba(95, 227, 159, 0)
+            }
+        }
+
+        .badge.flash .led {
+            animation: pulse .6s ease-out
+        }
+
+        .controls {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            align-items: center
+        }
+
+        .sep {
+            width: 1px;
+            height: 22px;
+            background: var(--line-strong);
+            margin: 0 4px
+        }
+
+        button {
+            font-family: inherit;
+            font-size: 12px;
+            color: var(--text);
+            background: var(--panel);
+            border: 1px solid var(--line-strong);
+            border-radius: 6px;
+            padding: 7px 11px;
+            cursor: pointer;
+            transition: border-color .15s, background .15s, color .15s;
+        }
+
+        button:hover {
+            border-color: var(--text);
+            background: #1a1d22
+        }
+
+        button:active {
+            transform: translateY(1px)
+        }
+
+        button.primary {
+            border-color: var(--green-dim);
+            color: var(--green)
+        }
+
+        button.primary:hover {
+            border-color: var(--green);
+            background: rgba(95, 227, 159, .08)
+        }
+
+        button.ghost {
+            color: var(--dim)
+        }
+
+        button[data-state="off"] {
+            color: var(--amber);
+            border-color: rgba(245, 185, 66, .4)
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns:1fr minmax(230px, .85fr) 1fr;
+            gap: 16px;
+            align-items: start
+        }
+
+        @media (max-width: 920px) {
+            .grid {
+                grid-template-columns:1fr
+            }
+        }
+
+        .panel {
+            background: var(--panel);
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            padding: 16px
+        }
+
+        .replica .rhead {
+            display: flex;
+            align-items: center;
+            gap: 9px;
+            margin-bottom: 14px
+        }
+
+        .replica .rhead h2 {
+            font-size: 15px
+        }
+
+        .dot {
+            width: 9px;
+            height: 9px;
+            border-radius: 50%
+        }
+
+        .replica[data-r="A"] .dot {
+            background: var(--a);
+            box-shadow: 0 0 9px var(--a)
+        }
+
+        .replica[data-r="B"] .dot {
+            background: var(--b);
+            box-shadow: 0 0 9px var(--b)
+        }
+
+        .rid {
+            margin-left: auto;
+            color: var(--faint);
+            font-size: 11px
+        }
+
+        .field {
+            display: block;
+            margin-bottom: 14px
+        }
+
+        .field span {
+            display: block;
+            color: var(--dim);
+            font-size: 11px;
+            margin-bottom: 5px;
+            text-transform: uppercase;
+            letter-spacing: .6px
+        }
+
+        input[type=text], input:not([type]) {
+            width: 100%;
+            font-family: inherit;
+            font-size: 13px;
+            color: var(--text);
+            background: var(--panel-2);
+            border: 1px solid var(--line-strong);
+            border-radius: 6px;
+            padding: 8px 10px;
+        }
+
+        input:focus {
+            outline: none;
+            border-color: var(--text)
+        }
+
+        .replica[data-r="A"] input:focus {
+            border-color: var(--a)
+        }
+
+        .replica[data-r="B"] input:focus {
+            border-color: var(--b)
+        }
+
+        .addrow {
+            display: flex;
+            gap: 7px;
+            margin-bottom: 10px
+        }
+
+        .addrow input {
+            flex: 1
+        }
+
+        .list {
+            list-style: none;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            min-height: 36px
+        }
+
+        .list li {
+            display: flex;
+            align-items: center;
+            gap: 9px;
+            padding: 7px 9px;
+            border-radius: 6px;
+            background: var(--panel-2);
+            border: 1px solid var(--line);
+            animation: slidein .18s ease;
+        }
+
+        @keyframes slidein {
+            from {
+                opacity: 0;
+                transform: translateY(-3px)
+            }
+            to {
+                opacity: 1;
+                transform: none
+            }
+        }
+
+        .chk {
+            flex: none;
+            width: 16px;
+            height: 16px;
+            padding: 0;
+            border-radius: 4px;
+            background: transparent
+        }
+
+        .chk.done {
+            background: var(--green);
+            border-color: var(--green)
+        }
+
+        .txt {
+            flex: 1;
+            word-break: break-word
+        }
+
+        .txt.done {
+            color: var(--faint);
+            text-decoration: line-through
+        }
+
+        .idtag {
+            color: var(--faint);
+            font-size: 10px
+        }
+
+        .del {
+            flex: none;
+            padding: 2px 8px;
+            color: var(--dim);
+            border-color: transparent;
+            background: transparent
+        }
+
+        .del:hover {
+            color: var(--red);
+            border-color: rgba(248, 113, 113, .4)
+        }
+
+        .cap {
+            color: var(--faint);
+            font-size: 11px;
+            margin-top: 10px
+        }
+
+        .wire .whead {
+            display: flex;
+            align-items: center;
+            margin-bottom: 12px
+        }
+
+        .wire .whead h2 {
+            font-size: 14px
+        }
+
+        .qcount {
+            margin-left: auto;
+            color: var(--dim);
+            font-size: 11px
+        }
+
+        .queue {
+            list-style: none;
+            margin: 0 0 12px;
+            padding: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+            min-height: 60px;
+            max-height: 240px;
+            overflow: auto
+        }
+
+        .queue:empty::after {
+            content: "stream clear";
+            color: var(--faint);
+            font-size: 11px;
+            display: block;
+            padding: 8px 2px
+        }
+
+        .queue li {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 11.5px;
+            padding: 5px 8px;
+            border-radius: 5px;
+            background: var(--panel-2);
+            border-left: 2px solid var(--faint);
+            animation: slidein .15s ease
+        }
+
+        .queue li.from-A {
+            border-left-color: var(--a)
+        }
+
+        .queue li.from-B {
+            border-left-color: var(--b)
+        }
+
+        .queue .who {
+            color: var(--dim);
+            width: 42px
+        }
+
+        .queue li.from-A .who {
+            color: var(--a)
+        }
+
+        .queue li.from-B .who {
+            color: var(--b)
+        }
+
+        .queue .opx {
+            color: var(--text)
+        }
+
+        .queue .dup {
+            color: var(--amber);
+            margin-left: auto;
+            font-size: 10px
+        }
+
+        .wirebtns {
+            display: grid;
+            grid-template-columns:1fr 1fr;
+            gap: 7px
+        }
+
+        .wirebtns .wide {
+            grid-column: 1/-1
+        }
+
+        .log {
+            margin-top: 14px;
+            border-top: 1px solid var(--line);
+            padding-top: 10px;
+            font-size: 11px;
+            color: var(--dim);
+            max-height: 120px;
+            overflow: auto;
+            display: flex;
+            flex-direction: column-reverse;
+            gap: 4px
+        }
+
+        .log .t {
+            color: var(--green)
+        }
+
+        footer {
+            margin-top: 34px;
+            color: var(--faint);
+            font-size: 11px;
+            max-width: 80ch
+        }
+
+        footer code {
+            color: var(--dim)
+        }
+
+        .fail {
+            display: none;
+            border: 1px solid rgba(248, 113, 113, .5);
+            background: rgba(248, 113, 113, .06);
+            color: var(--text);
+            border-radius: 8px;
+            padding: 14px 16px;
+            margin-bottom: 18px
+        }
+
+        .fail code {
+            color: var(--amber)
+        }
+
+        /* reactions (PN-Counter) + undo row (1.1) */
+        .crow {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-top: 12px;
+            flex-wrap: wrap
+        }
+
+        .reactions {
+            display: flex;
+            align-items: center;
+            gap: 9px
+        }
+
+        .reactions .rlabel {
+            color: var(--dim);
+            font-size: 12px
+        }
+
+        .rbtn {
+            width: 26px;
+            height: 26px;
+            padding: 0;
+            border: 1px solid var(--line-strong);
+            background: var(--panel-2);
+            color: var(--text);
+            border-radius: 6px;
+            cursor: pointer;
+            font-family: 'Space Mono', monospace;
+            line-height: 1
+        }
+
+        @media (hover: hover) {
+            .rbtn:hover {
+                border-color: var(--green-dim);
+                color: var(--green)
+            }
+        }
+
+        .rcount {
+            min-width: 2.2ch;
+            text-align: center;
+            font-family: 'Space Mono', monospace;
+            font-weight: 700;
+            color: var(--green);
+            font-size: 15px
+        }
+
+        .undo {
+            font-size: 12px
+        }
+    </style>
+</head>
+<body>
+<header class="top">
+    <h1>lite<span class="sig">-</span>crdt</h1>
+    <p class="tagline">Two replicas of one document, each backed by its own CRDT engine. Take a side <b>offline</b>,
+        edit freely, then <b>reorder, duplicate, or replay</b> the operation stream between them. The two states always
+        reconcile to exactly the same result &mdash; no central server, no merge conflicts, no lost edits. Every panel
+        re-renders from a lite-signal effect bound to the projection; nothing here calls a render function by hand.</p>
+</header>
+
+<div class="fail" id="fail">
+    Could not load the library from source. This demo imports the real ESM via an import map, so it needs the
+    dependencies present and an http origin.
+    Run <code>npm install</code> in this folder, then serve it (e.g. <code>npx serve</code>) and open the served URL.
+</div>
+
+<section class="status">
+    <div class="badge" id="badge">
+        <span class="led"></span>
+        <span><span class="label" id="badge-label">&mdash;</span><br><span class="sub"
+                                                                           id="badge-sub">booting</span></span>
+    </div>
+    <div class="controls">
+        <button id="link" data-state="on">LINK: ONLINE</button>
+        <span class="sep"></span>
+        <button id="sc-lww" class="ghost">Scenario: concurrent edit (LWW)</button>
+        <button id="sc-aw" class="ghost">Scenario: delete vs re-add (add-wins)</button>
+        <button id="sc-batch" class="ghost">Scenario: batch edit (transact &rarr; one frame)</button>
+        <button id="reset" class="ghost">Reset</button>
+    </div>
+</section>
+
+<main class="grid">
+    <article class="panel replica" data-r="A">
+        <div class="rhead"><span class="dot"></span>
+            <h2>Alice</h2><span class="rid" id="rid-A"></span></div>
+        <label class="field"><span>Document title &middot; LWW-Map</span>
+            <input type="text" id="title-A" placeholder="untitled" autocomplete="off"></label>
+        <div class="addrow">
+            <input type="text" id="add-A" placeholder="Add a task..." autocomplete="off">
+            <button id="addbtn-A">Add</button>
+        </div>
+        <ul class="list" id="list-A"></ul>
+        <div class="cap" id="cap-A">OR-Set &middot; 0 items</div>
+        <div class="crow">
+            <div class="reactions"><span class="rlabel">Reactions &middot; PN-Counter</span>
+                <button class="rbtn" id="react-dn-A" title="decrement">&minus;</button>
+                <span class="rcount" id="react-A">0</span>
+                <button class="rbtn" id="react-up-A" title="increment">+</button>
+            </div>
+            <button class="ghost undo" id="undo-A" title="undo this replica's last local edit">&#8630; Undo</button>
+        </div>
+    </article>
+
+    <section class="panel wire">
+        <div class="whead"><h2>Op stream</h2><span class="qcount" id="qcount">0 in flight</span></div>
+        <ul class="queue" id="queue"></ul>
+        <div class="wirebtns">
+            <button id="d-next">Deliver next</button>
+            <button id="d-all" class="primary">Deliver all</button>
+            <button id="d-shuf">Shuffle</button>
+            <button id="d-dup">Duplicate one</button>
+            <button id="d-sync" class="wide">Force state-sync (getState / mergeState)</button>
+        </div>
+        <div class="log" id="log"></div>
+    </section>
+
+    <article class="panel replica" data-r="B">
+        <div class="rhead"><span class="dot"></span>
+            <h2>Bob</h2><span class="rid" id="rid-B"></span></div>
+        <label class="field"><span>Document title &middot; LWW-Map</span>
+            <input type="text" id="title-B" placeholder="untitled" autocomplete="off"></label>
+        <div class="addrow">
+            <input type="text" id="add-B" placeholder="Add a task..." autocomplete="off">
+            <button id="addbtn-B">Add</button>
+        </div>
+        <ul class="list" id="list-B"></ul>
+        <div class="cap" id="cap-B">OR-Set &middot; 0 items</div>
+        <div class="crow">
+            <div class="reactions"><span class="rlabel">Reactions &middot; PN-Counter</span>
+                <button class="rbtn" id="react-dn-B" title="decrement">&minus;</button>
+                <span class="rcount" id="react-B">0</span>
+                <button class="rbtn" id="react-up-B" title="increment">+</button>
+            </div>
+            <button class="ghost undo" id="undo-B" title="undo this replica's last local edit">&#8630; Undo</button>
+        </div>
+    </article>
+</main>
+
+<footer>
+    <p>While <code>LINK: ONLINE</code>, ops flow between replicas after a short delay (live collaboration). Go <code>OFFLINE</code>
+        to let edits diverge, then use the stream controls to deliver them in any order, with duplicates &mdash;
+        convergence holds regardless. <code>State-sync</code> hydrates one replica from the other's full state in a
+        single payload, the way a late-joining tab is onboarded without replaying the log.</p>
+    <p><b>New in 1.1:</b> the <b>Reactions</b> row is a <code>PN-Counter</code> &mdash; increment on either replica and
+        watch it converge by max-per-replica. <b>Undo</b> replays a replica's last local edit as a fresh inverse op, so
+        it converges like any other. The <b>batch</b> scenario uses <code>transact()</code>: four edits leave as one
+        <code>ops</code> frame (see the log) &mdash; one network send, one <code>applyOps</code> on the far side.</p>
+</footer>
+
+<script type="module" src="./demo.js"></script>
+</body>
+</html>

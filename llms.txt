@@ -1,0 +1,142 @@
+# @zakkster/lite-crdt
+
+> Operational CRDTs for @zakkster/lite-store. A last-write-wins map (LWW-Map) and an observed-remove set (OR-Set) whose converged state is projected into a reactive lite-store. Op-based, transport-agnostic, order-independent and duplicate-tolerant, with full-state sync for late joiners and an optional zero-config cross-tab transport. Single-file ESM, zero runtime dependencies.
+
+## Mental model
+
+- lite-crdt is the authoritative mutation API; lite-store is a reactive read-model (projection). You mutate through CRDT methods (which emit ops) and bind your UI to `collection.store`. You cannot derive correct ops from a transparent proxy's writes, hence this inversion.
+- `collection.store` is a READ-ONLY lite-store proxy. Writing to it throws `CRDTError("readonly")`. Mutate via `.set()/.add()/.delete()` only.
+- [1.1] The guard is DEEP: nested objects/arrays reached through `.store`, `get()`, `values()` or
+  `entries()` are wrapped too, so `map.store.cfg.theme = x` throws instead of mutating state with
+  no op emitted. Nested views are WeakMap-cached, so identity is stable across reads.
+- [1.1] Map `keys()/values()/entries()/snapshot()` are SORTED by key, not insertion-ordered:
+  replicas learn keys in different orders, so insertion order is not replica-independent.
+- [1.1] `"__proto__"` is not a usable map key: local `set()/delete()` throw
+  `CRDTError("misconfigured")`; an incoming remote op with that key is ignored (a peer must not
+  be able to crash a replica with one crafted op).
+- [1.1] `counter.inc(by)/dec(by)` require an integer within Number.MAX_SAFE_INTEGER and throw
+  `CRDTError("misconfigured")` otherwise; non-positive `by` remains a documented no-op.
+- Every op is commutative AND idempotent by construction. No seen-set is required; transports may reorder and redeliver freely.
+
+## Installation
+
+```
+npm install @zakkster/lite-crdt
+```
+
+Peer dependencies: `@zakkster/lite-store` (^1.0.0) and `@zakkster/lite-signal` (^1.1.3). Zero runtime dependencies of its own. ESM only. `node >= 18`.
+
+## Exports
+
+- `createCRDTDoc(options?)` -> doc
+- `connectBroadcastChannel(doc, channelName)` -> `{ dispose() }`  (optional cross-tab transport over native BroadcastChannel)
+- `CRDTError` (class; `.code` is one of `kind_mismatch | malformed_op | readonly | misconfigured`)
+
+## createCRDTDoc(options)
+
+options: `{ replicaId?: string, clock?: number, onError?: (e) => void, undoDepth?: number }`. `replicaId` is auto-generated if omitted; supply a per-session-unique id in production. `onError` receives errors thrown by `op`/`change` listeners (which are otherwise isolated). `undoDepth` bounds the local undo/redo rings (default 100; 0 disables history).
+
+doc surface:
+- `doc.replicaId: string`
+- `doc.clock(): number` -- current Lamport time
+- `doc.map(name): LWWMap` -- get/create an LWW-Map (cached by name; throws `kind_mismatch` if the name exists as an array)
+- `doc.array(name, opts?): ORSet` -- get/create an OR-Set; `opts.identify?: (value) => string | number` (defaults to `(v) => v.id`)
+- `doc.counter(name): PNCounter` -- get/create a PN-Counter (cached by name; throws `kind_mismatch` if the name exists as another kind) [1.1]
+- `doc.transact(fn): T` -- run fn; buffer its ops and flush as ONE `ops` frame + one coalesced `change`; reactive readers update once (runs in a lite-signal batch); nested transacts flush at the outermost close; ops before a throw still flush; returns fn's value [1.1]
+- `doc.undo(): boolean` / `doc.redo(): boolean` -- invert the last local edit / re-apply it; each is itself a local edit that EMITS an op, so peers converge; returns false if the ring is empty [1.1]
+- `doc.canUndo(): boolean` / `doc.canRedo(): boolean` / `doc.clearHistory(): void` [1.1]
+- `doc.applyOp(op): void` -- apply a remote op; idempotent and commutative; NEVER re-emits; auto-creates the collection if unseen, inferring kind from op type
+- `doc.applyOps(ops): void`
+- `doc.getState(): DocState` -- serialize full converged state (JSON) for hydrating a late joiner
+- `doc.mergeState(state): void` -- merge a remote full state (idempotent, commutative)
+- `doc.on('op', cb): () => void` -- locally-generated ops, one call per op; forward these to your transport; returns a disposer
+- `doc.on('ops', cb): () => void` -- batched local ops: one call per `transact` (or a 1-op array per single edit); the built-in BroadcastChannel transport uses this so a transaction is one frame [1.1]
+- `doc.on('change', cb): () => void` -- any convergent state change (local or remote); returns a disposer
+- `doc.snapshot(): object` -- plain deep copy of every collection
+- `doc.dispose(): void` -- release signals and clear listeners; subsequent mutations and applyOp are silent
+
+## LWWMap (doc.map)
+
+Keyed register map; last write wins under a `(lamport, replicaId)` total order; deletes are timestamped tombstones competing with writes.
+
+- reactive reads: `get(key)`, `has(key)` (fine-grained: re-run only when that key changes); `keys()`, `values()`, `entries()`, `size` (coarse: re-run on any change)
+- mutations (emit ops): `set(key, value)`, `delete(key)`
+- `store` -- read-only reactive lite-store projection (object); writing throws
+- `snapshot()` -- plain object of present entries
+- keys are coerced to strings.
+
+Resolution: set-vs-set and set-vs-delete both resolve by higher lamport, tie broken by higher replicaId string. Re-delivery is a no-op.
+
+## ORSet (doc.array)
+
+Observed-remove set keyed by a stable element id, with a last-write-wins value register per id.
+
+- reactive reads: `has(value)`, `hasId(id)`, `get(id)`, `values()`, `ids()`, `size` (coarse)
+- mutations (emit ops): `add(value)` / `push(value)` (alias), `delete(value)`, `deleteById(id)`
+- `store` -- read-only reactive lite-store projection (array); writing or calling a mutator (push/splice/...) throws
+- `snapshot()` -- plain array in order
+
+Semantics:
+- A fresh `add` mints a unique membership tag. Concurrent add vs remove is ADD-WINS.
+- Re-adding a present id edits its value (last-write-wins) WITHOUT a new tag and WITHOUT changing order. This is the key DX choice vs a textbook OR-Set: edits do not reorder the list.
+- `delete`/`deleteById` removes only the tags the caller has observed; a concurrent add of a new tag survives.
+- Order is deterministic across replicas: by each element's first-add `(lamport, replicaId)`.
+- Elements must have a stable id (via `identify` or an `id` field); a missing id throws `misconfigured`.
+
+## PNCounter (doc.counter) [1.1]
+
+Positive-Negative counter: two grow-only per-replica maps (increments P, decrements N); value = sum(P) - sum(N).
+
+- reactive read: `value()` (subscribe); untracked `peek()`; `size` getter aliases `value()`
+- mutations (emit ops): `inc(by=1)`, `dec(by=1)` -- non-positive `by` is ignored
+- `snapshot()` -- plain number
+- Convergence: ops carry the replica's NEW cumulative P (or N); apply takes MAX per replica. Idempotent (re-max is a no-op) and commutative (max is). NO lamport -- counters converge by max, not total order. Use for votes/likes/reactions/presence.
+
+## Operation wire format (JSON)
+
+- LWW set: `{ t:"set", c, k, v, l, r }`
+- LWW delete: `{ t:"del", c, k, l, r }`
+- OR add: `{ t:"add", c, id, n, v, l, r }`   (tag = `r + "#" + n`)
+- OR update (value only): `{ t:"upd", c, id, v, l, r }`
+- OR remove: `{ t:"rm", c, id, g:[tagKey...], l, r }`
+- Counter inc: `{ t:"cinc", c, r, p }`   (p = replica's new cumulative increments; NO `l`)
+- Counter dec: `{ t:"cdec", c, r, n }`   (n = replica's new cumulative decrements; NO `l`)
+
+`c` = collection name, `l` = lamport, `r` = replicaId. Ops are emitted only for local mutations. `push` of a present id emits `upd`; of an absent id emits `add`.
+
+## Transports
+
+- Manual: `doc.on('op', op => send(op))` out; `doc.applyOp(received)` in. Works over WebSocket, WebRTC, server fan-out, or a watched JSON file.
+- Cross-tab: `connectBroadcastChannel(doc, channelName)` subscribes to `ops` (so a transact() burst is ONE frame) and runs a request/state handshake to hydrate late joiners; receive side accepts both `ops` and legacy single-`op` frames. Uses native BroadcastChannel; no dependency. Returns `{ dispose() }`.
+
+## Errors
+
+`CRDTError` with `.code`:
+- `kind_mismatch` -- a collection name already exists as the other kind
+- `malformed_op` -- applyOp received a non-op or unknown op type
+- `readonly` -- attempted to mutate a `.store` projection directly
+- `misconfigured` -- bad listener registration, missing element id, or BroadcastChannel unavailable
+
+## Constraints and non-goals (v1)
+
+- Values are held by reference locally and copied over the wire; treat them as immutable (pass new objects to edit; do not mutate stored objects).
+- No RGA / positional sequence / reorder / rich text. Order is causal, not index-positional.
+- No tombstone garbage collection; LWW tombstones and OR removed-tags accumulate.
+- Browser globals (BroadcastChannel) are only required by `connectBroadcastChannel`; the core is environment-neutral.
+
+## Minimal example
+
+```js
+import { createCRDTDoc, connectBroadcastChannel } from "@zakkster/lite-crdt";
+import { effect } from "@zakkster/lite-signal";
+
+const doc = createCRDTDoc({ replicaId: crypto.randomUUID() });
+const todos = doc.array("todos");
+const conn = connectBroadcastChannel(doc, "todo-room");   // cross-tab
+
+effect(() => renderList(todos.values()));   // reactive UI
+
+todos.push({ id: "1", text: "buy milk", done: false });
+todos.push({ id: "1", text: "buy milk", done: true });    // edit, no reorder
+todos.deleteById("1");
+```

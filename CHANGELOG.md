@@ -4,6 +4,43 @@ All notable changes to `@zakkster/lite-crdt` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2026-08-30
+
+Packaging and gate release. No behaviour change to the runtime; existing state
+and ops are byte-compatible with 1.1.0.
+
+### Added
+
+- **`package.json`** -- the package had none, so it could not be installed,
+  tested, or published. Declares `type: module`, `exports`, `files[]`,
+  `engines.node >=18`, its `@zakkster/lite-store` + `@zakkster/lite-signal`
+  runtime deps, and `@zakkster/lite-gc-profiler` + `@zakkster/lite-leak` dev
+  deps. Scripts: `test`, `torture`, `verify`.
+- **`VERSION`** export from `CRDT.js`, in three-place sync with `package.json`
+  and this file.
+- **Gated torture harness** (`test/torture.mjs` + `test/torture/`): a seeded,
+  zero-alloc-gated suite over the fixed T0..T9 tier namespace. Wired this
+  release: T0 metamorphic laws, T5 differential convergence fuzz (a gated,
+  fixed-capacity descendant of `bench/torture/convergence-fuzzer.mjs`), T6 the
+  zero-alloc gate on the `applyOp` receive path (`maxArrayBuffersGrowth: 0`,
+  `stabilize: 'deep'`), T7 the merge-cycle soak with a `lite-leak` retention
+  witness, and T9 the controls tier (every gate proven able to fail). T1 and T4
+  are registered thin and filled in 1.1.2.
+
+### Known issues (reproduced; fixed in 1.1.2 -- see ROADMAP.md sec. 3)
+
+The remote `applyOp` / `mergeState` path validates the op envelope (`t`, `c`)
+but trusts the payload. Registered as `todo` regression tests in
+`test/regressions.test.mjs`, each with a runnable reproduction:
+
+- **C-01** a remote op with `l: Infinity` permanently poisons the Lamport clock.
+- **C-02** a register written with `l: NaN` can never be overwritten.
+- **C-03** a remote counter op with a non-number `p`/`n` poisons the value.
+- **C-04** `applyOp` accepts `set`/`del` ops with missing / non-number `l`.
+- **C-05** a kind-mismatched remote op throws uncaught out of `applyOps`.
+- **C-06** `mergeState` throws a raw `TypeError` on a malformed payload.
+- **C-07** the Lamport clock silently stops advancing at 2^53.
+
 ## [1.1.0] - 2026-07-16
 
 ### Added

@@ -1,0 +1,75 @@
+{
+  "name": "@zakkster/lite-crdt",
+  "version": "1.1.1",
+  "description": "Operational CRDTs for @zakkster/lite-store: an LWW-Map and an observed-remove OR-Set (plus a PN-Counter) whose converged state is projected into a reactive lite-store. Op-based, transport-agnostic, order-independent and duplicate-tolerant, with full-state sync and an optional cross-tab BroadcastChannel transport. Single-file ESM, zero runtime dependencies beyond the lite-store/lite-signal reactive core.",
+  "keywords": [
+    "crdt",
+    "lww",
+    "or-set",
+    "pn-counter",
+    "convergent",
+    "eventual-consistency",
+    "offline-first",
+    "collaborative",
+    "reactive",
+    "signals",
+    "esm",
+    "zero-dependency"
+  ],
+  "type": "module",
+  "main": "./CRDT.js",
+  "module": "./CRDT.js",
+  "types": "./CRDT.d.ts",
+  "exports": {
+    ".": {
+      "types": "./CRDT.d.ts",
+      "node": "./CRDT.js",
+      "import": "./CRDT.js",
+      "default": "./CRDT.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "sideEffects": false,
+  "files": [
+    "CRDT.js",
+    "CRDT.d.ts",
+    "README.md",
+    "llms.txt",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --expose-gc --test test/*.test.mjs",
+    "torture": "node --expose-gc test/torture.mjs",
+    "verify": "npm test && npm run torture"
+  },
+  "dependencies": {
+    "@zakkster/lite-signal": "^1.5.0",
+    "@zakkster/lite-store": "^1.2.0"
+  },
+  "devDependencies": {
+    "@zakkster/lite-gc-profiler": "^1.16.0",
+    "@zakkster/lite-leak": "^1.10.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PeshoVurtoleta/lite-crdt.git"
+  },
+  "homepage": "https://github.com/PeshoVurtoleta/lite-crdt#readme",
+  "bugs": {
+    "url": "https://github.com/PeshoVurtoleta/lite-crdt/issues",
+    "email": "shinikchiev@yahoo.com"
+  },
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/PeshoVurtoleta"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

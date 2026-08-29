@@ -2,6 +2,9 @@
 // Project: https://www.npmjs.com/package/@zakkster/lite-crdt
 // Definitions by: Zahary Shinikchiev
 
+/** Package version (three-place sync with package.json and CHANGELOG.md). */
+export const VERSION: string;
+
 export type CRDTErrorCode =
     | "kind_mismatch"
     | "malformed_op"

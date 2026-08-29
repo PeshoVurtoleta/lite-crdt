@@ -1,5 +1,5 @@
 /**
- * @zakkster/lite-crdt v1.1.0
+ * @zakkster/lite-crdt v1.1.1
  * --------------------------
  * Operational CRDTs for @zakkster/lite-store. Two convergent data types backed
  * by signal-reactive projections:
@@ -42,6 +42,9 @@ import { signal, dispose as disposeSignal, batch } from "@zakkster/lite-signal";
  * Typed error for programmer mistakes: collection kind mismatch, malformed op,
  * writing through a read-only projection, or a missing element id.
  */
+/** Package version. Kept in three-place sync with package.json and CHANGELOG.md. */
+export const VERSION = "1.1.1";
+
 export class CRDTError extends Error {
     constructor(code, message, opts) {
         super(message, opts);

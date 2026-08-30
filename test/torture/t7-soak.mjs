@@ -30,4 +30,22 @@ export function run() {
     }
 
     check(tracker.size() === 0, () => `T7: leak tracker retained ${tracker.size()} docs after ${CYCLES} dispose cycles`);
+
+    // Door-specific retention witness: 4096 apply/reject cycles (every cycle
+    // feeds one good op AND one poison op through the door, so the reject path
+    // itself is exercised, not just the happy path) must leave nothing tracked
+    // once every doc is disposed -- no retention across the reject-and-continue
+    // door (a rejected op's report()/onError closure must not pin the doc).
+    const DOOR_CYCLES = 4096;
+    const doorTracker = createLeakTracker({ name: "lite-crdt-door-soak" });
+    for (let i = 0; i < DOOR_CYCLES; i++) {
+        const d = createCRDTDoc({ replicaId: "DOOR", onError: () => {} });
+        const handle = doorTracker.track(d, () => d.dispose(), "door-doc");
+        d.map("m").set("k", i);                                            // good
+        d.applyOp({ t: "set", c: "m", k: "k", l: Infinity, r: "evil", v: -1 }); // reject
+        d.applyOp({ t: "cinc", c: "c", r: "evil", p: "999" });              // reject
+        d.dispose();
+        doorTracker.untrack(handle);
+    }
+    check(doorTracker.size() === 0, () => `T7: leak tracker retained ${doorTracker.size()} docs after ${DOOR_CYCLES} apply/reject cycles`);
 }

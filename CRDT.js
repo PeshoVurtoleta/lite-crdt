@@ -1,5 +1,5 @@
 /**
- * @zakkster/lite-crdt v1.1.1
+ * @zakkster/lite-crdt v1.1.2
  * --------------------------
  * Operational CRDTs for @zakkster/lite-store. Two convergent data types backed
  * by signal-reactive projections:
@@ -43,7 +43,7 @@ import { signal, dispose as disposeSignal, batch } from "@zakkster/lite-signal";
  * writing through a read-only projection, or a missing element id.
  */
 /** Package version. Kept in three-place sync with package.json and CHANGELOG.md. */
-export const VERSION = "1.1.1";
+export const VERSION = "1.1.2";
 
 export class CRDTError extends Error {
     constructor(code, message, opts) {
@@ -192,16 +192,28 @@ function createLWWMap(name, ctx) {
         return { kind: "map", entries: e };
     }
 
+    // Returns the MAX register lamport actually absorbed, so the doc can advance
+    // its clock past it (C-12): a merged register with l=9 must not leave the
+    // clock at 0, or the next local write emits l=1 and silently loses forever.
     function mergeState(s) {
-        let touched = false;
-        for (const k in s.entries) {
-            const a = s.entries[k];
-            const op = a[2]
-                ? { t: "del", k, l: a[0], r: a[1] }
-                : { t: "set", k, l: a[0], r: a[1], v: a[3] };
-            if (apply(op)) touched = true;
+        let maxL = 0;
+        const src = s.entries;
+        if (src === null || typeof src !== "object") return 0;
+        for (const k in src) {
+            // Read the register and its scalars EXACTLY ONCE, validate the
+            // locals, and merge from those SAME locals (TOCTOU / C-11).
+            const a = src[k];
+            if (!Array.isArray(a)) { ctx.report(new CRDTError("malformed_state", "map dropped a malformed entry '" + k + "'.")); continue; }
+            const l = a[0], r = a[1], del = a[2], v = a[3];
+            if (typeof l !== "number" || !Number.isFinite(l) || l >= MAX_LAMPORT || typeof r !== "string") {
+                ctx.report(new CRDTError("malformed_state", "map dropped entry '" + k + "' with a non-finite lamport or bad replicaId."));
+                continue;
+            }
+            const op = del ? { t: "del", k, l, r } : { t: "set", k, l, r, v };
+            apply(op);
+            if (l > maxL) maxL = l;   // count every VALIDATED lamport, win or lose (symmetric with applyOp)
         }
-        return touched;
+        return maxL;
     }
 
     return {
@@ -224,6 +236,9 @@ function createLWWMap(name, ctx) {
                 throw new CRDTError("misconfigured",
                     "'__proto__' cannot be used as a map key — it would be silently dropped. Prefix or rename the key.");
             }
+            // tick() BEFORE record(): tick can throw at the clock ceiling, and a
+            // failed write must not leave a phantom inverse in the undo ring.
+            const l = ctx.tick();
             if (ctx.recording) {
                 const cur = entries.get(k);
                 const wasPresent = cur ? !cur.del : false;
@@ -231,7 +246,6 @@ function createLWWMap(name, ctx) {
                     ? { name, kind: "map", op: "set", k, v: cur.v }
                     : { name, kind: "map", op: "del", k });
             }
-            const l = ctx.tick();
             const op = { t: "set", c: name, k, v, l, r: ctx.replicaId };
             apply(op);
             ctx.emit(op);
@@ -242,12 +256,13 @@ function createLWWMap(name, ctx) {
                 throw new CRDTError("misconfigured",
                     "'__proto__' cannot be used as a map key — it would be silently dropped. Prefix or rename the key.");
             }
+            // tick() BEFORE record(): a ceiling throw must not leave a phantom inverse.
+            const l = ctx.tick();
             if (ctx.recording) {
                 const cur = entries.get(k);
                 if (cur && !cur.del) ctx.record({ name, kind: "map", op: "set", k, v: cur.v });
                 // deleting an absent key is a visible no-op; nothing to undo.
             }
-            const l = ctx.tick();
             const op = { t: "del", c: name, k, l, r: ctx.replicaId };
             apply(op);
             ctx.emit(op);
@@ -423,6 +438,8 @@ function createORSet(name, opts, ctx) {
     function add(value) {
         const id = idOf(value);
         const member = isMember(id);
+        // tick() BEFORE record(): a ceiling throw must not leave a phantom inverse.
+        const l = ctx.tick();
         if (ctx.recording) {
             if (member) {
                 const prev = valueReg.get(id);
@@ -431,7 +448,6 @@ function createORSet(name, opts, ctx) {
                 ctx.record({ name, kind: "set", op: "rmId", id });
             }
         }
-        const l = ctx.tick();
         let op;
         if (member) {
             op = { t: "upd", c: name, id, v: value, l, r: ctx.replicaId };
@@ -447,13 +463,14 @@ function createORSet(name, opts, ctx) {
         id = typeof id === "string" ? id : String(id);
         const tags = adds.get(id);
         if (tags === undefined || tags.size === 0) return false; // nothing observed to remove
+        // tick() BEFORE record(): a ceiling throw must not leave a phantom inverse.
+        const l = ctx.tick();
         if (ctx.recording) {
             const prev = valueReg.get(id);
             ctx.record({ name, kind: "set", op: "add", value: prev ? prev.v : undefined });
         }
         const g = [];
         for (const tagKey of tags.keys()) g.push(tagKey);
-        const l = ctx.tick();
         const op = { t: "rm", c: name, id, g, l, r: ctx.replicaId };
         apply(op);
         ctx.emit(op);
@@ -473,29 +490,61 @@ function createORSet(name, opts, ctx) {
         return { kind: "set", adds: a, removed: Array.from(removed), values: vals };
     }
 
+    // Returns the MAX lamport absorbed across every live tag AND every value
+    // register, so the doc advances its clock past it (C-12), symmetric with the
+    // map path and applyOp.
     function mergeState(s) {
+        let maxL = 0;
+        // Every untrusted scalar below is read EXACTLY ONCE into a local,
+        // validated, and merged from that same local (TOCTOU / C-11).
         // Union removed tombstones first so resurrected tags are suppressed.
-        for (let i = 0; i < s.removed.length; i++) removed.add(s.removed[i]);
-        // Union add tags (minus tombstoned).
-        for (const id in s.adds) {
-            const incoming = s.adds[id];
-            let tags = adds.get(id);
-            if (tags === undefined) { tags = new Map(); adds.set(id, tags); }
-            for (const tagKey in incoming) {
-                if (!removed.has(tagKey)) tags.set(tagKey, incoming[tagKey]);
+        const rem = s.removed;
+        if (Array.isArray(rem)) {
+            for (let i = 0; i < rem.length; i++) { const tk = rem[i]; if (typeof tk === "string") removed.add(tk); }
+        }
+        // Union add tags (minus tombstoned); validate each tag lamport at use.
+        const sadds = s.adds;
+        if (sadds !== null && typeof sadds === "object") {
+            for (const id in sadds) {
+                const incoming = sadds[id];
+                if (incoming === null || typeof incoming !== "object") continue;
+                let tags = adds.get(id);
+                if (tags === undefined) { tags = new Map(); adds.set(id, tags); }
+                for (const tagKey in incoming) {
+                    const l = incoming[tagKey];
+                    if (typeof l !== "number" || !Number.isFinite(l) || l >= MAX_LAMPORT) continue;
+                    if (!removed.has(tagKey)) { tags.set(tagKey, l); if (l > maxL) maxL = l; }
+                }
             }
         }
         // Prune any local tags now tombstoned by the merge.
         for (const [, tags] of adds) {
             for (const tagKey of tags.keys()) if (removed.has(tagKey)) tags.delete(tagKey);
         }
-        // LWW-merge value registers.
-        for (const id in s.values) {
-            const a = s.values[id];
-            setValue(id, a[0], a[1], a[2]);
+        // LWW-merge value registers; validate lamport/replicaId at use.
+        const svals = s.values;
+        if (svals !== null && typeof svals === "object") {
+            for (const id in svals) {
+                const a = svals[id];
+                if (!Array.isArray(a)) continue;
+                const l = a[0], r = a[1], v = a[2];
+                if (typeof l !== "number" || !Number.isFinite(l) || l >= MAX_LAMPORT || typeof r !== "string") continue;
+                setValue(id, l, r, v);
+                if (l > maxL) maxL = l;
+            }
+        }
+        // Consistency, checked against the ACTUAL merged Maps (immune to TOCTOU):
+        // a live add-id with no value register would crash rebuildProjection off
+        // an undefined `.v` (fail-open) and re-emit poison via getState. Drop its
+        // tags and report so getState stays clean.
+        for (const [id, tags] of adds) {
+            if (tags.size > 0 && !valueReg.has(id)) {
+                tags.clear();
+                ctx.report(new CRDTError("malformed_state", "set dropped live add-id '" + id + "' with no value register."));
+            }
         }
         rebuildProjection();
-        return true;
+        return maxL;
     }
 
     /** Recompute order + projection array from scratch (used by mergeState). */
@@ -611,10 +660,26 @@ function createPNCounter(name, ctx) {
     }
 
     function mergeState(s) {
-        for (const r in s.p) { const v = s.p[r]; if (v > (P.get(r) || 0)) P.set(r, v); }
-        for (const r in s.n) { const v = s.n[r]; if (v > (N.get(r) || 0)) N.set(r, v); }
+        // Read each cumulative EXACTLY ONCE, validate the local, merge from it
+        // (TOCTOU / C-11): a live-accessor payload cannot validate benign then
+        // hand max() a non-finite or negative value.
+        const sp = s.p, sn = s.n;
+        if (sp !== null && typeof sp === "object") {
+            for (const r in sp) {
+                const v = sp[r];
+                if (typeof v !== "number" || !Number.isFinite(v) || v < 0) { ctx.report(new CRDTError("malformed_state", "counter dropped P[" + r + "].")); continue; }
+                if (v > (P.get(r) || 0)) P.set(r, v);
+            }
+        }
+        if (sn !== null && typeof sn === "object") {
+            for (const r in sn) {
+                const v = sn[r];
+                if (typeof v !== "number" || !Number.isFinite(v) || v < 0) { ctx.report(new CRDTError("malformed_state", "counter dropped N[" + r + "].")); continue; }
+                if (v > (N.get(r) || 0)) N.set(r, v);
+            }
+        }
         publish();
-        return true;
+        return 0;   // PN-Counters carry no Lamport clock (converge by max); nothing to advance
     }
 
     return {
@@ -652,6 +717,71 @@ function createPNCounter(name, ctx) {
     };
 }
 
+/* ─── The remote-op validation door (reject-and-continue) ─────────────────── */
+
+/**
+ * Clock ceiling. At/above 2^53, `++lamport` is a float no-op and the (lamport,
+ * replicaId) total order silently collapses to the replicaId tiebreak, so an
+ * incoming `l` is bounded strictly below it (decisions/0001, C-07).
+ */
+const MAX_LAMPORT = 2 ** 53;
+
+/**
+ * Validate a remote op's convergence-driving fields IN PLACE -- scalar-only,
+ * zero allocation, no temp object/array. The envelope (`t`/`c` are strings) is
+ * already checked by applyOp before this runs; this is the choke point that
+ * keeps another replica's bytes from poisoning the clock (C-01/C-02/C-07),
+ * corrupting a counter (C-03), or freezing a register (C-04). Returns true iff
+ * the op is safe to apply. Cold path (network receive), never the emit/apply
+ * happy path.
+ */
+function okOp(op) {
+    const t = op.t;
+    // Counters carry no Lamport stamp: p / n must be a finite, non-negative
+    // number and the replicaId a non-empty string.
+    if (t === "cinc") return typeof op.p === "number" && Number.isFinite(op.p) && op.p >= 0 && typeof op.r === "string" && op.r.length > 0;
+    if (t === "cdec") return typeof op.n === "number" && Number.isFinite(op.n) && op.n >= 0 && typeof op.r === "string" && op.r.length > 0;
+    // Every other op type carries a Lamport stamp (l) and a replicaId (r).
+    const l = op.l;
+    if (typeof l !== "number" || !Number.isFinite(l) || l >= MAX_LAMPORT) return false;
+    if (typeof op.r !== "string" || op.r.length === 0) return false;
+    if (t === "set" || t === "del") return typeof op.k === "string";
+    if (t === "add") return typeof op.id === "string" && typeof op.n === "number";
+    if (t === "upd") return typeof op.id === "string";
+    if (t === "rm") {
+        const g = op.g;
+        if (!Array.isArray(g) || typeof op.id !== "string") return false;
+        for (let i = 0; i < g.length; i++) if (typeof g[i] !== "string") return false;
+        return true;
+    }
+    return false;
+}
+
+/**
+ * Cheap top-level container-shape check for a state-based collection payload:
+ * the containers each _mergeState will iterate are the right kind (objects, and
+ * an array for `removed`), so a wholly malformed collection is rejected and
+ * reported at the door (C-06). It DELIBERATELY does not deep-validate scalars:
+ * that is done at USE inside each _mergeState, which reads every untrusted
+ * scalar exactly once and merges from that same local. A validate-here-then-
+ * re-read-at-use split is a TOCTOU -- a live-accessor payload (getter/Proxy)
+ * would return a benign record to the validator and a poison one to the merge
+ * (C-11). So scalar validation lives at the single point of use, never here.
+ * Cold path -- runs once per collection on a full-state sync.
+ */
+function okState(cs, kind) {
+    if (kind === "map") {
+        return cs.entries !== null && typeof cs.entries === "object";
+    }
+    if (kind === "counter") {
+        return cs.p !== null && typeof cs.p === "object" && cs.n !== null && typeof cs.n === "object";
+    }
+    // set
+    return cs.adds !== null && typeof cs.adds === "object" &&
+        Array.isArray(cs.removed) &&
+        cs.values !== null && typeof cs.values === "object";
+}
+
 /* ─── Document ────────────────────────────────────────────────────────────── */
 
 /**
@@ -667,6 +797,16 @@ export function createCRDTDoc(options) {
     let disposed = false;
 
     const cols = new Map();          // name -> collection
+    // Pre-allocated scratch op for the receive door. applyOp copies each field of
+    // an untrusted op into it EXACTLY ONCE, then validates + clock-merges +
+    // applies from the scratch ONLY -- so a live-accessor op (getter/Proxy) cannot
+    // pass validation then be re-read with poison at use (TOCTOU / C-11). Zero
+    // per-op allocation (one scratch per doc, reused; keeps the T6 gate). Reused
+    // across reentrant applyOp because every collection's apply() reads all its op
+    // fields BEFORE it fires ctx.changed(), so a nested applyOp cannot clobber a
+    // field an outer apply() has yet to read. The local mutation API builds its
+    // own plain ops and never touches this scratch.
+    const scratchOp = { t: "", c: "", k: undefined, id: undefined, l: 0, r: "", v: undefined, n: undefined, p: undefined, g: undefined };
     // Listener lists are plain arrays iterated by index, so dispatch allocates
     // no iterator. (Adding/removing a listener from inside its own dispatch is
     // not guaranteed to take effect within that same dispatch.)
@@ -681,7 +821,16 @@ export function createCRDTDoc(options) {
     // (replicaId#counter) never collide for this writer.
     let tagCounter = 0;
 
-    const tick = () => ++lamport;
+    // Fail closed at the clock ceiling: rather than silently saturate (at/above
+    // 2^53 `++lamport` is a float no-op and causal order collapses, C-07), throw
+    // so the caller learns the doc can no longer order writes.
+    const tick = () => {
+        if (lamport >= MAX_LAMPORT - 2) {
+            throw new CRDTError("clock_ceiling",
+                "Lamport clock reached the 2^53 ceiling; the doc can no longer order writes.");
+        }
+        return ++lamport;
+    };
     tick.counter = () => tagCounter++;
 
     // ── Transactions ──
@@ -712,6 +861,7 @@ export function createCRDTDoc(options) {
     const ctx = {
         replicaId,
         tick,
+        report,   // collections route a dropped-at-use malformed state entry here
         recording: undoDepth > 0,
         emit(op) {
             if (disposed) return;
@@ -830,17 +980,47 @@ export function createCRDTDoc(options) {
 
         applyOp(op) {
             if (disposed) return;
-            if (op == null || typeof op !== "object" || typeof op.t !== "string" || typeof op.c !== "string") {
+            if (op == null || typeof op !== "object") {
                 throw new CRDTError("malformed_op", "applyOp expects an op object with string `t` and `c`.");
             }
-            const kind = kindFromOpType(op.t);
+            // Freeze the untrusted op into the doc-owned scratch, reading each
+            // field EXACTLY ONCE (TOCTOU / C-11). Every check + the clock merge +
+            // _apply below read ONLY `s`, so a live-accessor op cannot validate
+            // benign then apply poison. Zero allocation (scratch is reused).
+            const s = scratchOp;
+            s.t = op.t; s.c = op.c; s.k = op.k; s.id = op.id;
+            s.l = op.l; s.r = op.r; s.v = op.v; s.n = op.n; s.p = op.p; s.g = op.g;
+            if (typeof s.t !== "string" || typeof s.c !== "string") {
+                throw new CRDTError("malformed_op", "applyOp expects an op object with string `t` and `c`.");
+            }
+            const kind = kindFromOpType(s.t);
+            // The door (reject-and-continue, decisions/0001): a kind-mismatched
+            // collection OR a malformed payload is DROPPED and reported to
+            // onError -- never applied, never thrown out of applyOps. Runs before
+            // the clock merge so a poisoned `l` cannot touch the clock.
+            const existing = cols.get(s.c);
+            if ((existing !== undefined && existing.kind !== kind) || !okOp(s)) {
+                report(new CRDTError("malformed_op",
+                    "dropped a malformed or kind-mismatched '" + s.t + "' op for collection '" + s.c + "'."));
+                return;
+            }
             // Lamport merge: a later local event will exceed any observed op.
-            if (typeof op.l === "number" && op.l > lamport) lamport = op.l;
-            const col = getCollection(op.c, kind);
-            col._apply(op);
+            if (typeof s.l === "number" && s.l > lamport) lamport = s.l;
+            const col = getCollection(s.c, kind);
+            col._apply(s);
         },
 
-        applyOps(ops) { for (let i = 0; i < ops.length; i++) this.applyOp(ops[i]); },
+        // applyOps is RESILIENT (decisions/0001): the transport-safe batch path a
+        // custom transport uses. A single applyOp stays STRICT (a non-op envelope
+        // or unknown op type throws), but a batch must never throw on one bad
+        // frame -- the throw is caught, reported, and the batch continues so every
+        // good op still applies. okOp failures + kind-mismatch already
+        // report-and-continue inside applyOp; this catches the two throw paths.
+        applyOps(ops) {
+            for (let i = 0; i < ops.length; i++) {
+                try { this.applyOp(ops[i]); } catch (e) { report(e); }
+            }
+        },
 
         getState() {
             const out = {};
@@ -849,13 +1029,35 @@ export function createCRDTDoc(options) {
         },
 
         mergeState(state) {
-            if (disposed || state == null || typeof state.cols !== "object") return;
-            if (typeof state.clock === "number" && state.clock > lamport) lamport = state.clock;
+            if (disposed || state == null || typeof state !== "object" || state.cols === null || typeof state.cols !== "object") return;
+            // Bound the clock merge exactly like the op door: a non-finite or
+            // over-ceiling clock in an untrusted payload must not poison ours.
+            if (typeof state.clock === "number" && Number.isFinite(state.clock) && state.clock < MAX_LAMPORT && state.clock > lamport) {
+                lamport = state.clock;
+            }
             for (const name in state.cols) {
                 const cs = state.cols[name];
-                const kind = cs.kind === "map" || cs.kind === "counter" ? cs.kind : "set";
+                // Fail closed on a malformed collection: skip and report, never a
+                // raw TypeError and never a silent partial apply (C-06).
+                if (cs === null || typeof cs !== "object" || (cs.kind !== "map" && cs.kind !== "counter" && cs.kind !== "set")) {
+                    report(new CRDTError("malformed_state", "dropped a malformed collection '" + name + "'."));
+                    continue;
+                }
+                const kind = cs.kind;
+                const existing = cols.get(name);
+                if ((existing !== undefined && existing.kind !== kind) || !okState(cs, kind)) {
+                    report(new CRDTError("malformed_state", "dropped a malformed or kind-mismatched collection '" + name + "'."));
+                    continue;
+                }
                 const col = getCollection(name, kind);
-                col._mergeState(cs);
+                // Advance the clock past every lamport this merge absorbed (C-12),
+                // symmetric with applyOp's `s.l > lamport` bump -- otherwise a
+                // merged register with l=9 leaves the clock behind it and the next
+                // local write emits a lower l and silently loses forever. Every
+                // accepted lamport is < MAX_LAMPORT (validated at use), so the
+                // clock stays representable; the guard is belt-and-suspenders.
+                const maxSeen = col._mergeState(cs);
+                if (typeof maxSeen === "number" && maxSeen > lamport && maxSeen < MAX_LAMPORT) lamport = maxSeen;
             }
         },
 
@@ -873,6 +1075,11 @@ export function createCRDTDoc(options) {
             for (const [name, col] of cols) out[name] = col.snapshot();
             return out;
         },
+
+        // Internal: route an error to the doc's onError hook. Used by transports
+        // (connectBroadcastChannel) to fail closed on a crafted frame without
+        // letting it throw out of the message handler.
+        _report(e) { report(e); },
 
         dispose() {
             if (disposed) return;
@@ -918,14 +1125,21 @@ export function connectBroadcastChannel(doc, channelName) {
     bc.onmessage = (ev) => {
         const m = ev && ev.data;
         if (m == null || m.from === self) return;
-        if (m.t === "ops") {
-            doc.applyOps(m.ops);
-        } else if (m.t === "op") {            // accept legacy single-op frames too
-            doc.applyOp(m.op);
-        } else if (m.t === "req") {
-            bc.postMessage({ t: "state", from: self, to: m.from, state: doc.getState() });
-        } else if (m.t === "state" && (m.to === self || m.to == null)) {
-            doc.mergeState(m.state);
+        // Fail closed: a crafted frame (bad op type, non-array ops, malformed
+        // state) must not throw out of onmessage. The door already drops bad
+        // fields via onError; this catch handles the residual envelope throws.
+        try {
+            if (m.t === "ops") {
+                doc.applyOps(m.ops);
+            } else if (m.t === "op") {            // accept legacy single-op frames too
+                doc.applyOp(m.op);
+            } else if (m.t === "req") {
+                bc.postMessage({ t: "state", from: self, to: m.from, state: doc.getState() });
+            } else if (m.t === "state" && (m.to === self || m.to == null)) {
+                doc.mergeState(m.state);
+            }
+        } catch (e) {
+            doc._report(e);
         }
     };
 

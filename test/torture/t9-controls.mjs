@@ -13,14 +13,14 @@ export function run() {
     if (g.report.ok) die("T9 control 1: an allocating hot loop passed the zero-alloc gate");
     leak.length = 0;
 
-    // Control 2 -- validate() must THROW on a poisoned clock (this is finding
-    // C-01, still live in v1.1.1: applyOp with l:Infinity poisons the clock).
-    const poisoned = createCRDTDoc({ replicaId: "BAD" });
-    poisoned.applyOp({ t: "set", c: "m", k: "x", l: Infinity, r: "peer", v: 1 });
+    // Control 2 -- validate() must THROW on a non-finite clock. The applyOp
+    // l:Infinity vector that poisoned a real doc in v1.1.1 is now closed by the
+    // door, so validate() is fed a stub whose clock() is non-finite (validate
+    // only calls doc.clock() and doc.getState()); it must still bite.
+    const nonFinite = { clock: () => Infinity, getState: () => ({ cols: {} }) };
     let caught = false;
-    try { validate(poisoned); } catch { caught = true; }
+    try { validate(nonFinite); } catch { caught = true; }
     if (!caught) die("T9 control 2: validate() passed a doc with a non-finite clock");
-    poisoned.dispose();
 
     // Control 3 -- the convergence equality is NON-VACUOUS: two docs fed
     // genuinely different logs must produce different canonical snapshots, so a

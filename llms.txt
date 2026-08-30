@@ -34,7 +34,7 @@ Peer dependencies: `@zakkster/lite-store` (^1.0.0) and `@zakkster/lite-signal` (
 
 ## createCRDTDoc(options)
 
-options: `{ replicaId?: string, clock?: number, onError?: (e) => void, undoDepth?: number }`. `replicaId` is auto-generated if omitted; supply a per-session-unique id in production. `onError` receives errors thrown by `op`/`change` listeners (which are otherwise isolated). `undoDepth` bounds the local undo/redo rings (default 100; 0 disables history).
+options: `{ replicaId?: string, clock?: number, onError?: (e) => void, undoDepth?: number }`. `replicaId` is auto-generated if omitted; supply a per-session-unique id in production. `onError` receives errors thrown by `op`/`change` listeners (which are otherwise isolated) AND every remote op/state the validation door drops (a malformed field, a kind-mismatch, a malformed merge payload) [1.1.2]. `undoDepth` bounds the local undo/redo rings (default 100; 0 disables history).
 
 doc surface:
 - `doc.replicaId: string`
@@ -45,10 +45,10 @@ doc surface:
 - `doc.transact(fn): T` -- run fn; buffer its ops and flush as ONE `ops` frame + one coalesced `change`; reactive readers update once (runs in a lite-signal batch); nested transacts flush at the outermost close; ops before a throw still flush; returns fn's value [1.1]
 - `doc.undo(): boolean` / `doc.redo(): boolean` -- invert the last local edit / re-apply it; each is itself a local edit that EMITS an op, so peers converge; returns false if the ring is empty [1.1]
 - `doc.canUndo(): boolean` / `doc.canRedo(): boolean` / `doc.clearHistory(): void` [1.1]
-- `doc.applyOp(op): void` -- apply a remote op; idempotent and commutative; NEVER re-emits; auto-creates the collection if unseen, inferring kind from op type
-- `doc.applyOps(ops): void`
+- `doc.applyOp(op): void` -- apply a remote op; idempotent and commutative; NEVER re-emits; auto-creates the collection if unseen, inferring kind from op type. STRICT: a non-op envelope or an unknown op type throws `malformed_op`; a malformed field or a kind-mismatch is DROPPED and reported to `onError` (reject-and-continue), never applied [1.1.2]
+- `doc.applyOps(ops): void` -- apply a batch. RESILIENT: never throws on one bad frame -- a strict throw or a dropped op is routed to `onError` and the batch continues, so every good frame still applies. The transport-safe path a custom transport uses [1.1.2]
 - `doc.getState(): DocState` -- serialize full converged state (JSON) for hydrating a late joiner
-- `doc.mergeState(state): void` -- merge a remote full state (idempotent, commutative)
+- `doc.mergeState(state): void` -- merge a remote full state (idempotent, commutative); a malformed collection/register is dropped and reported to `onError`, never crashes [1.1.2]
 - `doc.on('op', cb): () => void` -- locally-generated ops, one call per op; forward these to your transport; returns a disposer
 - `doc.on('ops', cb): () => void` -- batched local ops: one call per `transact` (or a 1-op array per single edit); the built-in BroadcastChannel transport uses this so a transaction is one frame [1.1]
 - `doc.on('change', cb): () => void` -- any convergent state change (local or remote); returns a disposer

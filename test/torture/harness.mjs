@@ -88,7 +88,8 @@ export function canon(doc) {
  *   - every counter P/N value is a finite, non-negative number;
  *   - every live OR-Set id (has tags) has a value register.
  * O(state); called between torture phases, never on a hot path. C-01, C-02,
- * C-03, C-07 and C-10 each violate one of these lines the moment they occur.
+ * C-03, C-07 (finiteness/ceiling) and C-15/C-18/C-19 (the value-register and
+ * clock/lamport invariants) each violate one of these lines the moment they occur.
  */
 export function validate(doc) {
     const clock = doc.clock();
@@ -129,8 +130,23 @@ export function validate(doc) {
                 const tags = c.adds[id];
                 let live = false;
                 for (const _t in tags) { live = true; break; }
-                if (live && !(id in c.values)) {
+                if (live && !Object.hasOwn(c.values, id)) { // hasOwn: `in` walks the proto chain, so a proto-name id ("toString") would slip
                     throw new Error("validate: set '" + name + "' live id '" + id + "' has no value register");
+                }
+            }
+            // Every value register's lamport must be finite and <= clock, replicaId a
+            // string -- the map/counter branches check this, the set branch did not,
+            // which is the torture blind spot that hid C-18's non-finite value lamport.
+            for (const id in c.values) {
+                const rec = c.values[id]; // [l, r, v]
+                if (typeof rec[0] !== "number" || !Number.isFinite(rec[0])) {
+                    throw new Error("validate: set '" + name + "' value '" + id + "' lamport not finite: " + rec[0]);
+                }
+                if (typeof rec[1] !== "string") {
+                    throw new Error("validate: set '" + name + "' value '" + id + "' replicaId not a string");
+                }
+                if (rec[0] > clock) {
+                    throw new Error("validate: set '" + name + "' value '" + id + "' lamport " + rec[0] + " > clock " + clock);
                 }
             }
         }

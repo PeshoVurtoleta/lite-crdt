@@ -4,6 +4,74 @@ All notable changes to `@zakkster/lite-crdt` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.2] - 2026-08-30
+
+The remote-op validation door. `applyOp` / `applyOps` / `mergeState` previously
+validated only the op envelope (`t`, `c` are strings) and trusted every field
+that drives convergence; a single malformed or crafted remote frame could
+silently corrupt a doc or crash the receiver. This release adds one
+reject-and-continue validation door on the receive path
+(`decisions/0001-remote-op-door.md`). The local mutation API, the convergence
+algebra, and the zero-alloc receive hot path are unchanged; existing state and
+ops are byte-compatible with 1.1.1.
+
+### Fixed
+
+- **C-01** a remote op with a non-finite `l` (e.g. `Infinity`) permanently
+  poisoned the Lamport clock, silently dropping every later local write. `l` is
+  now validated finite and `< 2^53` at the door.
+- **C-02** a register written with `l: NaN` could never be overwritten (silent
+  key freeze). Non-finite lamports are now rejected.
+- **C-03** a remote counter op with a non-number / negative `p` or `n` poisoned
+  the value (string concat / `NaN` / `Infinity`). Counter cumulatives are now
+  validated finite and `>= 0`.
+- **C-04** `applyOp` accepted `set`/`del` ops with a missing / non-number `l` or
+  missing `r`. Per-op payload schema now enforced.
+- **C-05** a kind-mismatched remote op threw uncaught out of `applyOps`. It is
+  now dropped and reported to `onError`.
+- **C-06** `mergeState` crashed with a raw `TypeError` on a malformed payload.
+  It now validates each collection's shape and drops+reports malformed input.
+- **C-07** the Lamport clock silently stopped advancing at 2^53. `tick()` now
+  throws `clock_ceiling` at the boundary instead of saturating.
+Findings C-15 through C-19 were discovered by the reviewer during this session's
+audit (they are not in the original ROADMAP registry; see ROADMAP.md sec. 3):
+
+- **C-15** a crafted `mergeState` set collection with an add-id absent from
+  `values` (including a prototype-name id such as `toString`) crashed
+  `rebuildProjection` and re-emitted the poison. The door now cross-checks live
+  add-ids against an own-property (`Object.hasOwn`) `values` entry.
+- **C-17** a local write that hit the clock ceiling recorded a phantom undo
+  entry before it threw. `tick()` now runs before the undo record, so a failed
+  write leaves no phantom inverse.
+- **C-18** a time-of-check/time-of-use double-read let a live-accessor payload
+  pass validation with a benign value and apply a poison one. `applyOp` now
+  copies each untrusted field once into a reused per-doc scratch op (zero
+  allocation) and validates + applies off the scratch; `mergeState` validates
+  and merges each field from a single read.
+- **C-19** `mergeState` advanced the clock only from `state.clock`, leaving an
+  absorbed register at a lamport above the clock -> a permanent, self-
+  propagating register freeze. `mergeState` now advances the clock past every
+  register/tag lamport it absorbs, symmetric with `applyOp`.
+
+### Changed
+
+- **`applyOp` is STRICT; `applyOps` is RESILIENT (C-16).** A single `applyOp`
+  throws `malformed_op` on a non-op envelope or unknown op type (local
+  programmer-error surface); `applyOps` never throws on a bad frame -- each is
+  caught, routed to `onError`, and the batch continues, so every good frame
+  applies. The `BroadcastChannel` receive path is wrapped so a crafted frame
+  cannot escape `onmessage`.
+- **`onError`** now also receives every remote op / state the door drops (a
+  malformed field, a kind-mismatch, a malformed merge payload), in addition to
+  errors thrown by `op`/`change` listeners.
+
+### Notes
+
+- Verified by 151 `node:test` cases (0 failing) and the torture gate
+  (`node --expose-gc test/torture.mjs` -> `ok`) at seeds 1/7/12345/99999 and
+  `TORTURE_SCALE=4`. The `applyOp` receive hot path remains zero-allocation
+  (`maxMajor: 0`, `maxArrayBuffersGrowth: 0`, `stabilize: 'deep'`).
+
 ## [1.1.1] - 2026-08-30
 
 Packaging and gate release. No behaviour change to the runtime; existing state

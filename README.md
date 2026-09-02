@@ -5,8 +5,6 @@
 [![npm bundle size](https://img.shields.io/bundlephobia/minzip/@zakkster/lite-crdt?style=for-the-badge)](https://bundlephobia.com/result?p=@zakkster/lite-crdt)
 [![npm downloads](https://img.shields.io/npm/dm/@zakkster/lite-crdt?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-crdt)
 [![npm total downloads](https://img.shields.io/npm/dt/@zakkster/lite-crdt?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-crdt)
-[![lite-signal peer](https://img.shields.io/npm/dependency-version/@zakkster/lite-crdt/peer/@zakkster/lite-signal?style=for-the-badge&color=blue)](https://github.com/PeshoVurtoleta/lite-signal)
-[![lite-store peer](https://img.shields.io/npm/dependency-version/@zakkster/lite-crdt/peer/@zakkster/lite-store?style=for-the-badge&color=blue)](https://github.com/PeshoVurtoleta/lite-store)
 [![types](https://img.shields.io/npm/types/@zakkster/lite-crdt.svg)](./CRDT.d.ts)
 [![dependencies](https://img.shields.io/badge/dependencies-0-brightgreen.svg)](./package.json)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)

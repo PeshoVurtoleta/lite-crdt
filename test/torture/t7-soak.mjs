@@ -4,9 +4,12 @@
  * retained (a lite-leak witness -- a second, independent signal from the heap
  * gate: a leaked JS object and a leaked signal node cannot mask each other).
  *
- * The retention BOUND (C-10: valueReg/adds should be O(live), not O(ops)) is
- * decided and asserted in C2; this tier establishes the leak witness and the
- * per-cycle validate discipline now.
+ * The retention BOUND (C-10: the live `adds` map is O(live ids), not O(ops)) is
+ * asserted here as of C2: after a bounded id set is churned through many
+ * add/delete cycles, the number of `adds` entries never exceeds the live-id
+ * count -- an emptied id's dead tag Map is dropped, not retained. valueReg is
+ * deliberately KEPT (it carries the LWW max-lamport register; dropping it would
+ * diverge -- see decisions/0002).
  */
 import { createLeakTracker } from "@zakkster/lite-leak";
 import { createCRDTDoc } from "../../CRDT.js";
@@ -48,4 +51,29 @@ export function run() {
         doorTracker.untrack(handle);
     }
     check(doorTracker.size() === 0, () => `T7: leak tracker retained ${doorTracker.size()} docs after ${DOOR_CYCLES} apply/reject cycles`);
+
+    // Retention soak (C-10): churn a BOUNDED id set through many add/delete
+    // cycles. Each delete empties an id's tag Map; that dead entry must be
+    // dropped, so `adds` stays O(live ids) -- never O(cycles). If the empty entry
+    // leaked, adds size would climb toward RETAIN_CYCLES instead of <= ID_COUNT.
+    const RETAIN_CYCLES = 4096;
+    const ID_COUNT = 16;
+    const rprng = makePrng(SEED ^ 0x5a17);
+    const rd = createCRDTDoc({ replicaId: "RETAIN" });
+    const arr = rd.array("bag");
+    for (let i = 0; i < RETAIN_CYCLES; i++) {
+        const id = "id" + (Math.floor(frac(rprng) * ID_COUNT));
+        // add then (usually) delete the same id: an emptied id must drop its
+        // adds entry, while its value register legitimately persists.
+        arr.add({ id, v: i });
+        if (frac(rprng) < 0.75) arr.deleteById(id);
+    }
+    // The internal probe (not getState -- getState filters emptied tag Maps out):
+    // `adds` must equal the live member count, so no dead empty entry lingers.
+    const r = arr._retention();
+    check(r.adds === arr.size, () => `T7: adds map holds ${r.adds} entries but only ${arr.size} ids are live (${r.adds - arr.size} dead empty entries -- C-10 leak)`);
+    check(r.adds <= ID_COUNT, () => `T7: adds map grew to ${r.adds} over ${ID_COUNT} ids after ${RETAIN_CYCLES} cycles (retention is not O(live ids))`);
+    check(r.valueReg <= ID_COUNT, () => `T7: valueReg grew to ${r.valueReg} over ${ID_COUNT} ids (should be one register per distinct id)`);
+    validate(rd);
+    rd.dispose();
 }

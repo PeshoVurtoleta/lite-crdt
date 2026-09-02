@@ -67,17 +67,14 @@ export function runOpsGate(fn, opts) {
 
 /* ── Canonical whole-doc snapshot ───────────────────────────────────────────── */
 /**
- * doc.snapshot() top-level key order is replica-dependent (finding C-11): each
- * per-collection snapshot sorts its own keys, but the doc-level object iterates
- * collections in per-replica creation order. Sort the top level so two converged
- * replicas compare equal. (C-11 fixes this in the library; until then the gate
- * canonicalizes so a real divergence is never masked by a false one.)
+ * doc.snapshot() is now replica-independent: the doc sorts its top-level
+ * collection names and each per-collection snapshot sorts its own keys, so two
+ * converged replicas emit byte-identical JSON (C-11 fixed in the library, v1.2.0).
+ * canon() is therefore a raw JSON.stringify -- no top-level sort shim -- and the
+ * call sites are unchanged.
  */
 export function canon(doc) {
-    const s = doc.snapshot();
-    const out = {};
-    for (const k of Object.keys(s).sort()) out[k] = s[k];
-    return JSON.stringify(out);
+    return JSON.stringify(doc.snapshot());
 }
 
 /* ── validate(doc): the structural invariant ────────────────────────────────── */

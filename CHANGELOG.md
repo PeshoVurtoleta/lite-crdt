@@ -4,6 +4,46 @@ All notable changes to `@zakkster/lite-crdt` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-09-02
+
+Three orthogonal hygiene fixes on the OR-Set and the cold serialization surface
+(`decisions/0002-retention-and-names.md`). Convergence is UNCHANGED; the
+remote-op door (C1) and the mutation API are untouched; existing state and ops
+are byte-compatible with 1.1.2.
+
+### Fixed
+
+- **C-10** the OR-Set retained a dead empty tag `Map` for every id whose last
+  live tag was removed, so `adds` grew O(ops) under add/delete churn. The empty
+  entry is now dropped the moment `tags.size === 0` (in `apply`'s `rm` branch,
+  after the order-key reads, and in the `mergeState` prune + consistency loops),
+  making live-map retention O(live ids). The value register (`valueReg`) is
+  deliberately RETAINED: it carries the max-lamport `(l, r)` timestamp, and
+  dropping it would let a later lower-`l` re-add / `upd` win and diverge.
+- **C-11** `snapshot()` and `getState()` iterated collections in per-replica
+  creation order, so two converged replicas emitted different top-level key
+  order. Both now iterate collection names SORTED, so converged replicas produce
+  byte-identical JSON (each per-collection snapshot already sorted its own keys).
+  The torture harness `canon()` shim that papered over this is removed.
+- **C-12** a `__proto__` collection name, OR-Set element id, or PN-Counter
+  replicaId was silently lost (assigning it to a plain `{}` retargeted the
+  object's prototype instead of creating an own key). For the counter this was a
+  silent DIVERGENCE, not just a lost key: `getState().p`/`.n` are keyed by
+  replicaId, so a `__proto__` replica's cumulative count vanished from
+  serialized state and a hydrating peer converged to the wrong value with no
+  `onError`. Every `getState()` output object keyed by caller-supplied data --
+  the OR-Set `adds`/`values`, the counter `p`/`n`, the map `entries`, and the
+  document `getState()`/`snapshot()` `cols` -- now builds over
+  `Object.create(null)`, so a `__proto__` name/id/replicaId becomes an own key
+  that round-trips through `getState -> mergeState` intact. This removes the
+  crafted-`__proto__` hazard with no new throw (consistent with the door's
+  reject-and-continue posture); the LWW-Map key guard is unchanged.
+
+### Notes
+
+- Convergence math is unchanged and `valueReg` is deliberately retained (the C4
+  tombstone-GC seam widens later, gated by a causal-stability check).
+
 ## [1.1.2] - 2026-08-30
 
 The remote-op validation door. `applyOp` / `applyOps` / `mergeState` previously

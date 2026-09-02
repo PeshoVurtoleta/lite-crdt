@@ -212,8 +212,11 @@ test("applyOp / mergeState / snapshot after dispose stay silent (no throw, no wo
     doc.dispose();
     assert.doesNotThrow(() => doc.applyOp({ t: "set", c: "m", k: "z", v: 9, l: 99, r: "Z" }));
     assert.doesNotThrow(() => doc.mergeState({ replicaId: "X", clock: 1, cols: {} }));
-    assert.deepEqual(doc.snapshot(), {});
-    assert.deepEqual(doc.getState().cols, {});
+    // snapshot()/getState().cols build over Object.create(null) (C-12, so a
+    // __proto__ collection name is an own key), so assert emptiness by key count
+    // rather than deepEqual against a plain {} (which would trip on the prototype).
+    assert.equal(Object.keys(doc.snapshot()).length, 0);
+    assert.equal(Object.keys(doc.getState().cols).length, 0);
 });
 
 // ===========================================================================

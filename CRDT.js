@@ -1,5 +1,5 @@
 /**
- * @zakkster/lite-crdt v1.1.2
+ * @zakkster/lite-crdt v1.2.0
  * --------------------------
  * Operational CRDTs for @zakkster/lite-store. Two convergent data types backed
  * by signal-reactive projections:
@@ -43,7 +43,7 @@ import { signal, dispose as disposeSignal, batch } from "@zakkster/lite-signal";
  * writing through a read-only projection, or a missing element id.
  */
 /** Package version. Kept in three-place sync with package.json and CHANGELOG.md. */
-export const VERSION = "1.1.2";
+export const VERSION = "1.2.0";
 
 export class CRDTError extends Error {
     constructor(code, message, opts) {
@@ -185,9 +185,18 @@ function createLWWMap(name, ctx) {
     }
 
     function getState() {
-        const e = {};
-        for (const [k, rec] of entries) {
-            e[k] = rec.del ? [rec.l, rec.r, 1] : [rec.l, rec.r, 0, rec.v];
+        // Keys SORTED so two converged replicas serialize byte-identically
+        // regardless of the order they learned the keys (C-11). Cold path
+        // (full-state sync), so the sort's allocation never touches a hot loop.
+        // Object.create(null) for the uniform C-12 invariant: every getState
+        // output keyed by caller-supplied data is prototype-free. A "__proto__"
+        // map key cannot actually reach here (apply guards it at the door), but
+        // the file keeps ONE rule for all serializers, not three.
+        const e = Object.create(null);
+        const ks = [...entries.keys()].sort();
+        for (let i = 0; i < ks.length; i++) {
+            const rec = entries.get(ks[i]);
+            e[ks[i]] = rec.del ? [rec.l, rec.r, 1] : [rec.l, rec.r, 0, rec.v];
         }
         return { kind: "map", entries: e };
     }
@@ -430,6 +439,13 @@ function createORSet(name, opts, ctx) {
             }
             if (changed) recomputeOK(id);
             reconcile(id, prevMember, prevL, prevR, prevVal);
+            // Retention (C-10): once an id has no live tags, its adds entry is a
+            // dead empty Map. Drop it AFTER recomputeOK + reconcile, both of which
+            // read the id's order key -- so membership never outlives the id and no
+            // read loses its key. valueReg is KEPT: it carries the max-lamport (l,r)
+            // register, and dropping it would let a later lower-l add/upd win and
+            // diverge (see decisions/0002). O(live ids), not O(ops).
+            if (tags !== undefined && tags.size === 0) adds.delete(id);
             return true;
         }
         throw new CRDTError("malformed_op", "OR-Set cannot apply op type '" + op.t + "'");
@@ -478,16 +494,32 @@ function createORSet(name, opts, ctx) {
     }
 
     function getState() {
-        const a = {};
-        for (const [id, tags] of adds) {
+        // Object.create(null) so a `__proto__` element id becomes an OWN key
+        // instead of retargeting the object's prototype -- it round-trips through
+        // getState -> mergeState intact, and it drops a crafted-`__proto__` throw
+        // surface for free (C-12; consistent with the door's reject-and-continue
+        // posture -- no new throw). Cold path (full-state sync).
+        // ids and tag keys SORTED (and removed sorted) so two converged replicas
+        // serialize byte-identically regardless of add order (C-11). Cold path.
+        const a = Object.create(null);
+        const addIds = [...adds.keys()].sort();
+        for (let i = 0; i < addIds.length; i++) {
+            const id = addIds[i];
+            const tags = adds.get(id);
             if (tags.size === 0) continue;
-            const m = {};
-            for (const [tagKey, l] of tags) m[tagKey] = l;
+            const m = Object.create(null);
+            const tagKeys = [...tags.keys()].sort();
+            for (let j = 0; j < tagKeys.length; j++) m[tagKeys[j]] = tags.get(tagKeys[j]);
             a[id] = m;
         }
-        const vals = {};
-        for (const [id, rec] of valueReg) vals[id] = [rec.l, rec.r, rec.v];
-        return { kind: "set", adds: a, removed: Array.from(removed), values: vals };
+        const vals = Object.create(null);
+        const valIds = [...valueReg.keys()].sort();
+        for (let i = 0; i < valIds.length; i++) {
+            const id = valIds[i];
+            const rec = valueReg.get(id);
+            vals[id] = [rec.l, rec.r, rec.v];
+        }
+        return { kind: "set", adds: a, removed: Array.from(removed).sort(), values: vals };
     }
 
     // Returns the MAX lamport absorbed across every live tag AND every value
@@ -517,9 +549,13 @@ function createORSet(name, opts, ctx) {
                 }
             }
         }
-        // Prune any local tags now tombstoned by the merge.
-        for (const [, tags] of adds) {
+        // Prune any local tags now tombstoned by the merge, and drop the adds
+        // entry the moment it empties (C-10 retention): a union that created a
+        // tag Map for an id whose every incoming tag was already tombstoned, or a
+        // prune that removed the last live tag, must not leave a dead empty Map.
+        for (const [id, tags] of adds) {
             for (const tagKey of tags.keys()) if (removed.has(tagKey)) tags.delete(tagKey);
+            if (tags.size === 0) adds.delete(id);
         }
         // LWW-merge value registers; validate lamport/replicaId at use.
         const svals = s.values;
@@ -539,7 +575,7 @@ function createORSet(name, opts, ctx) {
         // tags and report so getState stays clean.
         for (const [id, tags] of adds) {
             if (tags.size > 0 && !valueReg.has(id)) {
-                tags.clear();
+                adds.delete(id);   // drop the whole entry (C-10): no empty Map left behind
                 ctx.report(new CRDTError("malformed_state", "set dropped live add-id '" + id + "' with no value register."));
             }
         }
@@ -584,6 +620,10 @@ function createORSet(name, opts, ctx) {
         _apply: apply,
         _getState: getState,
         _mergeState: mergeState,
+        // Test-only retention probe (C-10): live-map cardinalities that getState()
+        // cannot reveal (it filters emptied tag Maps out). `adds` must track live
+        // members, never O(ops); `valueReg` is deliberately retained per id.
+        _retention() { return { adds: adds.size, valueReg: valueReg.size, removed: removed.size }; },
         _dispose() { disposeStore(proj); disposeSignal(rev); adds.clear(); removed.clear(); valueReg.clear(); okL.clear(); okR.clear(); order.length = 0; },
     };
 }
@@ -653,9 +693,18 @@ function createPNCounter(name, ctx) {
     }
 
     function getState() {
-        const p = {}, n = {};
-        for (const [r, v] of P) p[r] = v;
-        for (const [r, v] of N) n[r] = v;
+        // Replica keys SORTED so two converged replicas serialize byte-identically
+        // regardless of the order they learned each replica's cumulative (C-11).
+        // Object.create(null) because the keys are caller-supplied replicaIds: a
+        // "__proto__" replicaId (accepted by okOp, or an unvalidated local doc id)
+        // would hit the `__proto__` setter on a plain {}, which silently DROPS a
+        // number value -> the P/N entry vanishes from serialized state and the
+        // peer diverges with zero onError (C-12). Cold path (full-state sync).
+        const p = Object.create(null), n = Object.create(null);
+        const pk = [...P.keys()].sort();
+        for (let i = 0; i < pk.length; i++) p[pk[i]] = P.get(pk[i]);
+        const nk = [...N.keys()].sort();
+        for (let i = 0; i < nk.length; i++) n[nk[i]] = N.get(nk[i]);
         return { kind: "counter", p, n };
     }
 
@@ -1023,8 +1072,16 @@ export function createCRDTDoc(options) {
         },
 
         getState() {
-            const out = {};
-            for (const [name, col] of cols) out[name] = col._getState();
+            // Cold path (called between phases on a full-state sync, never on the
+            // apply/emit/rm hot loop), so the sort's allocation is acceptable and
+            // buys replica-independent output. Names SORTED and `out` built over
+            // Object.create(null): two converged replicas emit byte-identical JSON
+            // regardless of collection-creation order, and a `__proto__`
+            // COLLECTION name round-trips as an OWN key rather than clobbering the
+            // prototype (C-11 / C-12).
+            const out = Object.create(null);
+            const names = [...cols.keys()].sort();
+            for (let i = 0; i < names.length; i++) out[names[i]] = cols.get(names[i])._getState();
             return { replicaId, clock: lamport, cols: out };
         },
 
@@ -1071,8 +1128,14 @@ export function createCRDTDoc(options) {
         },
 
         snapshot() {
-            const out = {};
-            for (const [name, col] of cols) out[name] = col.snapshot();
+            // Cold path (between phases, never on a hot loop). Names SORTED and
+            // `out` over Object.create(null) so two converged replicas produce a
+            // byte-identical snapshot regardless of collection-creation order (the
+            // per-collection snapshots already sort their own keys) and a
+            // `__proto__` collection name round-trips as an OWN key (C-11 / C-12).
+            const out = Object.create(null);
+            const names = [...cols.keys()].sort();
+            for (let i = 0; i < names.length; i++) out[names[i]] = cols.get(names[i]).snapshot();
             return out;
         },
 

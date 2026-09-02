@@ -255,3 +255,110 @@ test("C-19: mergeState must advance the clock past every lamport it absorbs, so 
         d.dispose();
     }
 });
+
+test("C-10: churning one id add/delete must not retain an empty adds entry, but must keep its value register", () => {
+    // Retention (decisions/0002): when an id's last live tag is removed, its adds
+    // entry is a dead empty Map and is dropped -- so adds is O(live ids), not
+    // O(ops). valueReg is KEPT deliberately: it carries the max-lamport (l, r)
+    // register, and dropping it would let a later lower-l add/upd win and diverge.
+    const d = createCRDTDoc({ replicaId: "R" });
+    const arr = d.array("bag");
+    const before = arr._retention();
+    assert.deepEqual(before, { adds: 0, valueReg: 0, removed: 0 }, "fresh OR-Set is not empty");
+    for (let i = 0; i < 10000; i++) {
+        arr.add({ id: "same", n: i });
+        arr.deleteById("same");
+    }
+    const after = arr._retention();
+    // The retention win, made visible: 10k add/delete cycles of ONE id leave zero
+    // adds entries (the emptied Map is dropped, not retained) and exactly one
+    // value register (kept, for convergence).
+    assert.equal(after.adds, 0, "adds retained a dead empty entry after delete (leak): adds.size=" + after.adds);
+    assert.equal(after.valueReg, 1, "value register was dropped (convergence hazard): valueReg.size=" + after.valueReg);
+    // Publicly observable: the id is no longer a member, its value register survives.
+    const st = d.getState().cols.bag;
+    assert.equal(Object.keys(st.adds).length, 0, "getState re-emitted a live add entry for a deleted id");
+    assert.equal(Object.keys(st.values).length, 1, "getState dropped the retained value register");
+    assert.equal(d.array("bag").hasId("same"), false, "deleted id still reports as a member");
+    d.dispose();
+});
+
+test("C-11: two replicas converging on the same ops emit byte-identical snapshot() and getState() regardless of collection-creation order", () => {
+    // snapshot()/getState() are now replica-independent: the doc sorts its
+    // top-level collection names and each collection sorts its own keys. So the
+    // torture canon() shim is gone -- raw JSON.stringify(snapshot()) compares equal.
+    const ops = [
+        { t: "set", c: "zeta", k: "x", l: 1, r: "p", v: 1 },
+        { t: "set", c: "alpha", k: "y", l: 2, r: "p", v: 2 },
+        { t: "add", c: "arr", id: "i1", n: 0, v: { id: "i1", n: 5 }, l: 3, r: "p" },
+        { t: "set", c: "mid", k: "z", l: 4, r: "p", v: 3 },
+        { t: "add", c: "arr", id: "i2", n: 1, v: { id: "i2", n: 6 }, l: 5, r: "p" },
+        { t: "cinc", c: "votes", r: "p", p: 7 },
+    ];
+    // Same replicaId so getState()'s top-level replicaId/clock also match; the ops
+    // carry their own r, so this is purely a receive-side convergence.
+    const a = createCRDTDoc({ replicaId: "R" });
+    const b = createCRDTDoc({ replicaId: "R" });
+    for (let i = 0; i < ops.length; i++) a.applyOp(ops[i]);
+    for (let i = ops.length - 1; i >= 0; i--) b.applyOp(ops[i]);   // reversed => different creation order
+    // No canon shim: the raw stringify must already be equal.
+    assert.equal(JSON.stringify(a.snapshot()), JSON.stringify(b.snapshot()), "snapshot() diverged on collection-creation order");
+    assert.equal(JSON.stringify(a.getState()), JSON.stringify(b.getState()), "getState() diverged on collection-creation order");
+    a.dispose();
+    b.dispose();
+});
+
+test("C-12: a __proto__ collection name AND a __proto__ element id round-trip getState -> mergeState without prototype pollution", () => {
+    const d = createCRDTDoc({ replicaId: "R" });
+    // Collection named "__proto__", holding an element whose id is "__proto__".
+    d.array("__proto__").add({ id: "__proto__", n: 42 });
+    const state = d.getState();
+    // Object.create(null) makes both the collection name and the element id OWN
+    // keys instead of retargeting a prototype -- so the data actually survives.
+    assert.ok(Object.hasOwn(state.cols, "__proto__"), "the __proto__ collection was lost (name clobbered a prototype)");
+    const col = state.cols["__proto__"];
+    assert.ok(Object.hasOwn(col.adds, "__proto__"), "the __proto__ element id was lost from adds");
+    assert.ok(Object.hasOwn(col.values, "__proto__"), "the __proto__ element id was lost from values");
+    // Round-trip into a fresh doc.
+    const d2 = createCRDTDoc({ replicaId: "R2" });
+    d2.mergeState(state);
+    const got = d2.array("__proto__").get("__proto__");
+    assert.equal(got && got.n, 42, "the __proto__/__proto__ element did not survive the round-trip");
+    // No prototype pollution: neither building nor merging the state touched a shared prototype.
+    assert.equal(({}).polluted, undefined, "Object.prototype was polluted");
+    assert.equal(Object.getPrototypeOf({}), Object.prototype, "a fresh object's prototype changed");
+    d.dispose();
+    d2.dispose();
+});
+
+test("C-12: a __proto__ replicaId on a PN-Counter round-trips getState -> mergeState without divergence", () => {
+    // The counter is keyed by replicaId, which is caller-supplied and reaches P/N
+    // both remotely (okOp accepts r="__proto__": string, length>0) and locally (a
+    // doc replicaId is unvalidated). On a plain {} serializer, p["__proto__"]=<n>
+    // hits the __proto__ setter, which silently drops a non-object value -> the
+    // entry vanishes and the peer diverges with zero onError. Object.create(null)
+    // makes it an own key that round-trips.
+    const errors = [];
+    const a = createCRDTDoc({ replicaId: "R", onError: (e) => errors.push(e) });
+    // A crafted remote cinc under a "__proto__" replicaId (the remote axis)...
+    a.applyOp({ t: "cinc", c: "votes", r: "__proto__", p: 5 });
+    // ...plus a local edit under the doc's own "__proto__" replica (the local axis).
+    const b = createCRDTDoc({ replicaId: "__proto__" });
+    b.counter("votes").inc(3);
+    // Cross-merge and assert both replicas converge on the same value.
+    const sa = a.getState();
+    assert.ok(Object.hasOwn(sa.cols.votes.p, "__proto__"), "the __proto__ replica cumulative was dropped from serialized state");
+    const merged = createCRDTDoc({ replicaId: "M" });
+    merged.mergeState(sa);
+    merged.mergeState(b.getState());
+    // R saw p[__proto__]=5, B (as replica __proto__) saw p[__proto__]=3; max wins => 5.
+    assert.equal(a.counter("votes").value(), 5, "counter A diverged");
+    assert.equal(merged.counter("votes").value(), 5, "merged replica diverged from the source counter");
+    assert.equal(errors.length, 0, "a well-formed __proto__ replicaId op was wrongly reported to onError");
+    // No prototype pollution from either build or merge.
+    assert.equal(({}).polluted, undefined, "Object.prototype was polluted");
+    assert.equal(Object.getPrototypeOf({}), Object.prototype, "a fresh object's prototype changed");
+    a.dispose();
+    b.dispose();
+    merged.dispose();
+});

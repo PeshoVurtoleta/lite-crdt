@@ -14,6 +14,9 @@
 - [1.1] `"__proto__"` is not a usable map key: local `set()/delete()` throw
   `CRDTError("misconfigured")`; an incoming remote op with that key is ignored (a peer must not
   be able to crash a replica with one crafted op).
+- [1.2] A `"__proto__"` COLLECTION name or OR-Set element id is fine, unlike a map key: `getState()`
+  builds its output over `Object.create(null)`, so such a name/id becomes an own key that
+  round-trips through `getState -> mergeState` intact (no prototype is retargeted, no throw added).
 - [1.1] `counter.inc(by)/dec(by)` require an integer within Number.MAX_SAFE_INTEGER and throw
   `CRDTError("misconfigured")` otherwise; non-positive `by` remains a documented no-op.
 - Every op is commutative AND idempotent by construction. No seen-set is required; transports may reorder and redeliver freely.
@@ -47,12 +50,12 @@ doc surface:
 - `doc.canUndo(): boolean` / `doc.canRedo(): boolean` / `doc.clearHistory(): void` [1.1]
 - `doc.applyOp(op): void` -- apply a remote op; idempotent and commutative; NEVER re-emits; auto-creates the collection if unseen, inferring kind from op type. STRICT: a non-op envelope or an unknown op type throws `malformed_op`; a malformed field or a kind-mismatch is DROPPED and reported to `onError` (reject-and-continue), never applied [1.1.2]
 - `doc.applyOps(ops): void` -- apply a batch. RESILIENT: never throws on one bad frame -- a strict throw or a dropped op is routed to `onError` and the batch continues, so every good frame still applies. The transport-safe path a custom transport uses [1.1.2]
-- `doc.getState(): DocState` -- serialize full converged state (JSON) for hydrating a late joiner
+- `doc.getState(): DocState` -- serialize full converged state (JSON) for hydrating a late joiner; collection names are emitted SORTED, so two converged replicas produce byte-identical output [1.2]
 - `doc.mergeState(state): void` -- merge a remote full state (idempotent, commutative); a malformed collection/register is dropped and reported to `onError`, never crashes [1.1.2]
 - `doc.on('op', cb): () => void` -- locally-generated ops, one call per op; forward these to your transport; returns a disposer
 - `doc.on('ops', cb): () => void` -- batched local ops: one call per `transact` (or a 1-op array per single edit); the built-in BroadcastChannel transport uses this so a transaction is one frame [1.1]
 - `doc.on('change', cb): () => void` -- any convergent state change (local or remote); returns a disposer
-- `doc.snapshot(): object` -- plain deep copy of every collection
+- `doc.snapshot(): object` -- plain deep copy of every collection; top-level collection names are key-sorted and each collection sorts its own keys, so the snapshot is replica-independent (converged replicas stringify byte-identically) [1.2]
 - `doc.dispose(): void` -- release signals and clear listeners; subsequent mutations and applyOp are silent
 
 ## LWWMap (doc.map)
@@ -121,7 +124,7 @@ Positive-Negative counter: two grow-only per-replica maps (increments P, decreme
 
 - Values are held by reference locally and copied over the wire; treat them as immutable (pass new objects to edit; do not mutate stored objects).
 - No RGA / positional sequence / reorder / rich text. Order is causal, not index-positional.
-- No tombstone garbage collection; LWW tombstones and OR removed-tags accumulate.
+- No tombstone garbage collection; LWW tombstones, OR removed-tags and OR value registers still accumulate O(distinct ids seen). An OR-Set member's live-membership entry IS dropped once its last tag is removed, so live-membership retention is O(live ids), not O(ops) [1.2]; full tombstone GC needs a causal-stability check and is out of scope for v1.
 - Browser globals (BroadcastChannel) are only required by `connectBroadcastChannel`; the core is environment-neutral.
 
 ## Minimal example

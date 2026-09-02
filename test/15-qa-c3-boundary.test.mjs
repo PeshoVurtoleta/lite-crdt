@@ -197,22 +197,24 @@ test("C-14 boundary: N-1/N/N+1 auto-minted ids stay collision-free across the bo
     for (const d of docs) d.dispose();
 });
 
-test("C-14 adversarial: an EMPTY STRING replicaId is falsy and silently falls back to auto-mint (not used verbatim)", () => {
-    // `opts.replicaId || genReplicaId()` treats "" as absent. A caller who
-    // explicitly passes "" (perhaps meaning "no id yet") does NOT get "" back --
-    // they silently get an auto-minted id instead. Documented here as the
-    // adversarial case the planner did not enumerate: it is not a crash, but it
-    // is a surprising divergence between "falsy" and "explicitly supplied".
-    const d = createCRDTDoc({ replicaId: "" });
-    assert.notEqual(d.replicaId, "", "empty string was NOT used verbatim");
-    assert.equal(d.replicaId.length, ID_WIDTH, "fell back to a real auto-minted id");
-    d.dispose();
+test("C-20: an empty-string replicaId now throws misconfigured (was: silent auto-mint) -- see decisions/0005", () => {
+    // Pre-C-20, `opts.replicaId || genReplicaId()` treated "" as absent and
+    // silently fell back to an auto-minted id, discarding the caller's explicit
+    // (if useless) input with zero signal. C-20 (decisions/0005, option A)
+    // reverses this: a provided-but-invalid id is a caller error and must fail
+    // loud, at construction, not fail open into a substituted id.
+    assert.throws(
+        () => createCRDTDoc({ replicaId: "" }),
+        (e) => e instanceof CRDTError && e.code === "misconfigured",
+        "an explicit empty string is now REJECTED, not silently replaced",
+    );
 });
 
-test("C-14 boundary: null replicaId falls back to auto-mint", () => {
-    const d = createCRDTDoc({ replicaId: null });
-    assert.equal(d.replicaId.length, ID_WIDTH);
-    d.dispose();
+test("C-20: null replicaId now throws misconfigured (was: silent auto-mint) -- see decisions/0005", () => {
+    assert.throws(
+        () => createCRDTDoc({ replicaId: null }),
+        (e) => e instanceof CRDTError && e.code === "misconfigured",
+    );
 });
 
 test("C-14 boundary: undefined replicaId falls back to auto-mint", () => {
@@ -221,16 +223,18 @@ test("C-14 boundary: undefined replicaId falls back to auto-mint", () => {
     d.dispose();
 });
 
-test("C-14 boundary: NaN replicaId (falsy) falls back to auto-mint", () => {
-    const d = createCRDTDoc({ replicaId: NaN });
-    assert.equal(d.replicaId.length, ID_WIDTH);
-    d.dispose();
+test("C-20: NaN replicaId now throws misconfigured (was: silent auto-mint, because NaN is falsy) -- see decisions/0005", () => {
+    assert.throws(
+        () => createCRDTDoc({ replicaId: NaN }),
+        (e) => e instanceof CRDTError && e.code === "misconfigured",
+    );
 });
 
-test("C-14 boundary: -0 replicaId (falsy) falls back to auto-mint", () => {
-    const d = createCRDTDoc({ replicaId: -0 });
-    assert.equal(d.replicaId.length, ID_WIDTH);
-    d.dispose();
+test("C-20: -0 replicaId now throws misconfigured (was: silent auto-mint, because -0 is falsy) -- see decisions/0005", () => {
+    assert.throws(
+        () => createCRDTDoc({ replicaId: -0 }),
+        (e) => e instanceof CRDTError && e.code === "misconfigured",
+    );
 });
 
 test("C-14: an explicit, truthy caller-supplied replicaId is used VERBATIM (not overwritten)", () => {
@@ -302,35 +306,22 @@ test("C-14 re-entrant write: calling undo() again from inside the 'op' listener 
     d.dispose();
 });
 
-test("C-14 adversarial (not enumerated by the planner): a non-string, truthy replicaId (a number) is accepted verbatim locally but silently breaks convergence with a peer", () => {
-    // `opts.replicaId || genReplicaId()` performs no typeof check: a truthy
-    // non-string (e.g. a number) is accepted and stamped onto every local op's
-    // `r` field. Locally this works fine (no validation on the local write
-    // path). But the RECEIVE door (okOp) requires `typeof op.r === "string"`
-    // for every peer that applies this replica's ops remotely -- so a doc
-    // created this way can mutate itself freely while every op it emits is
-    // silently DROPPED by any peer that receives it over the wire. This is a
-    // real, currently-unguarded misconfiguration hazard, distinct from (and in
-    // addition to) the falsy-replicaId cases above.
-    const a = createCRDTDoc({ replicaId: 42 });
-    assert.equal(a.replicaId, 42, "the numeric replicaId is used verbatim, unvalidated");
-    const A = a.map("m");
-    A.set("k", "v1");
-    assert.equal(A.get("k"), "v1", "local read/write still works");
-
-    const b = createCRDTDoc({ replicaId: "B" });
-    const emitted = [];
-    a.on("op", (op) => emitted.push(op));
-    A.set("k", "v2");
-    assert.equal(emitted.length, 1);
-    // Deliver the op to a real peer: the door drops it (r is not a string).
-    const errors = [];
-    b.onError !== undefined; // no-op reference kept for clarity
-    const bb = createCRDTDoc({ replicaId: "B2", onError: (e) => errors.push(e) });
-    bb.applyOp(emitted[0]);
-    assert.equal(bb.map("m").has("k"), false, "the peer's door silently dropped the op because r was not a string -- non-string replicaId breaks convergence");
-    assert.equal(errors.length, 1, "the door reported the drop rather than silently swallowing it with zero signal");
-    a.dispose(); b.dispose(); bb.dispose();
+test("C-20: a non-string, truthy replicaId (a number) now throws misconfigured AT CONSTRUCTION -- the divergence hazard is closed at the boundary, not left to the remote door (was: accepted verbatim, silently broke convergence) -- see decisions/0005", () => {
+    // Pre-C-20, `opts.replicaId || genReplicaId()` performed no typeof check: a
+    // truthy non-string (e.g. a number) was accepted and stamped onto every
+    // local op's `r` field, and every PEER's door (okOp, requiring
+    // `typeof op.r === "string"`) silently dropped every op this doc emitted --
+    // a one-way divergence with zero local signal. C-20 closes this exact
+    // hazard at the LOCAL boundary: the doc can no longer even be constructed
+    // with such an id, so the divergence can no longer occur at all.
+    assert.throws(
+        () => createCRDTDoc({ replicaId: 42 }),
+        (e) => e instanceof CRDTError && e.code === "misconfigured",
+        "a non-string truthy replicaId is now rejected at construction, before any collection or op exists",
+    );
+    // No doc, no collection, no op was ever created from the throwing call --
+    // there is nothing to deliver to a peer and nothing for that peer's door to
+    // silently drop anymore.
 });
 
 /* ─────────────────────────── Portability (C-14 fix) ────────────────────────── */

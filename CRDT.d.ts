@@ -245,7 +245,13 @@ export interface CRDTDoc {
     dispose(): void;
 }
 
-/** Create a CRDT document: a namespace of convergent collections sharing one Lamport clock and replica id. */
+/**
+ * Create a CRDT document: a namespace of convergent collections sharing one Lamport clock and replica id.
+ *
+ * @throws {CRDTError} `misconfigured` if a provided `replicaId` is not a non-empty string
+ *   (it stamps every op's `r` and every OR-Set tag `r#n`; a non-string or empty id emits ops
+ *   every peer's door drops). Only an OMITTED `replicaId` is auto-generated.
+ */
 export function createCRDTDoc(options?: CRDTDocOptions): CRDTDoc;
 
 /**

@@ -1,5 +1,5 @@
 /**
- * @zakkster/lite-crdt v1.3.0
+ * @zakkster/lite-crdt v1.3.1
  * --------------------------
  * Operational CRDTs for @zakkster/lite-store. Two convergent data types backed
  * by signal-reactive projections:
@@ -52,7 +52,7 @@ import { signal, dispose as disposeSignal, batch } from "@zakkster/lite-signal";
  * writing through a read-only projection, or a missing element id.
  */
 /** Package version. Kept in three-place sync with package.json and CHANGELOG.md. */
-export const VERSION = "1.3.0";
+export const VERSION = "1.3.1";
 
 export class CRDTError extends Error {
     constructor(code, message, opts) {
@@ -1075,7 +1075,29 @@ function minAckOf(V) {
  */
 export function createCRDTDoc(options) {
     const opts = options || {};
-    const replicaId = opts.replicaId || genReplicaId();
+    // C-20: validate a caller-supplied replicaId at the LOCAL boundary, mirroring
+    // the remote door okOp (`typeof op.r === "string" && op.r.length > 0`). Without
+    // this, a non-string but truthy id was accepted locally yet every op it emits
+    // carries a non-string `r` that EVERY peer's door drops -- a one-way silent
+    // divergence with no onError on this side. A falsy id ("" / 0) silently fell
+    // through `|| genReplicaId()` and got auto-minted, overriding the caller. Fail
+    // closed: only an OMITTED id (undefined) auto-mints; any provided id must be a
+    // non-empty string. No charset cap (a tagKey `r#n` splits on the LAST "#", so
+    // "team#alice" is valid) and no length cap (the door imposes none; a stricter
+    // local rule would reject an explicit id a peer legitimately emits). Cold path:
+    // once per doc, never on any hot body. See decisions/0005 (and 0003 / C-14).
+    const ridOpt = opts.replicaId;
+    let replicaId;
+    if (ridOpt === undefined) {
+        replicaId = genReplicaId();
+    } else if (typeof ridOpt === "string" && ridOpt.length > 0) {
+        replicaId = ridOpt;
+    } else {
+        throw new CRDTError(
+            "misconfigured",
+            "`replicaId` must be a non-empty string when provided (it stamps every op's `r` and every OR-Set tag `r#n`, and drives the (lamport, replicaId) total order); a non-string or empty id emits ops every peer's door drops. Omit `replicaId` to auto-mint one.",
+        );
+    }
     let lamport = opts.clock | 0;
     let disposed = false;
 

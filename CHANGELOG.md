@@ -4,6 +4,36 @@ All notable changes to `@zakkster/lite-crdt` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] - 2026-09-02
+
+One S2 misconfiguration finding (`decisions/0005-local-replica-id-validation.md`),
+a follow-up to C-14 logged during C3's QA and cut as a patch on top of 1.3.0. The
+convergence algebra does NOT change, the wire format does NOT change, and the
+remote-op door (C1), C2 serialization / retention, C3 undo / identity, and the
+1.3.0 compaction / delta-sync work (C4) are all untouched. One cold line in
+`createCRDTDoc` changes; the apply, emit, add, rm, cinc, tick and compact hot
+bodies gain zero branches and zero bytes.
+
+### Fixed
+
+- **C-20** a caller-supplied `replicaId` is now validated at the local
+  `createCRDTDoc` boundary, mirroring the remote-op door (`okOp` requires
+  `typeof op.r === "string" && op.r.length > 0`). Before this, two silent
+  misconfigurations slipped through `opts.replicaId || genReplicaId()`: (1) a
+  NON-STRING but truthy id (a number, object) was accepted locally -- the doc
+  mutated fine -- yet every op it emitted carried a non-string `r` that EVERY
+  peer's door DROPPED, so the replica's writes never converged to any peer, a
+  one-way silent divergence with zero `onError` on the originating side; (2) a
+  FALSY id (`""`, `0`, `null`) fell through the `||` and was silently
+  auto-minted, overriding a caller who supplied a specific (falsy) id. Now only
+  an OMITTED id (`opts.replicaId === undefined`) auto-mints; any provided id must
+  be a non-empty string, else `createCRDTDoc` throws `CRDTError("misconfigured")`
+  at construction, before any collection or op. No charset cap (an embedded `#`
+  stays valid -- a tag `r#n` splits on the last `#`, so `"team#alice"` round-trips)
+  and no length cap (the door imposes none; a stricter local rule would reject an
+  explicit id a peer legitimately emits). This is the fail-closed enforcement of
+  the replica-uniqueness assumption C-14 only documented. `decisions/0005`.
+
 ## [1.3.0] - 2026-09-02
 
 Tombstone compaction + delta sync (`decisions/0004-compaction-and-delta.md`). A

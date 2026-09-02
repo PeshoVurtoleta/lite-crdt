@@ -13,7 +13,7 @@
  */
 import { createLeakTracker } from "@zakkster/lite-leak";
 import { createCRDTDoc } from "../../CRDT.js";
-import { SEED, makePrng, frac, check, validate } from "./harness.mjs";
+import { SEED, makePrng, frac, check, validate, canon } from "./harness.mjs";
 import { drive } from "./corpus.mjs";
 
 const CYCLES = Math.max(1, Number(process.env.TORTURE_CYCLES) || 200);
@@ -106,4 +106,47 @@ export function run() {
     // per-op allocation (T6 proves apply stays zero-alloc).
     validate(wd);
     wd.dispose();
+
+    // C4 compaction soak: churn a BOUNDED live id set through a large add/delete
+    // workload on TWO docs stepped in lock-step -- one compacts at its own frontier
+    // (single writer, so its versionVector() IS the global min), the other never
+    // compacts. The compacting doc's tombstone census must fall to O(live ids); the
+    // uncompacted control's grows O(ops). Observable state stays identical, and the
+    // leak witness returns to 0 after dispose (decisions/0004).
+    const CHURN = 20000;
+    const CID = 24;
+    const compactTracker = createLeakTracker({ name: "lite-crdt-compact-soak" });
+    const cprng = makePrng(SEED ^ 0xc0117ac7);
+    const comp = createCRDTDoc({ replicaId: "COMP" });
+    const ctrl = createCRDTDoc({ replicaId: "COMP" });          // same id -> identical op stream
+    const compH = compactTracker.track(comp, () => comp.dispose(), "comp");
+    const ctrlH = compactTracker.track(ctrl, () => ctrl.dispose(), "ctrl");
+    const compArr = comp.array("bag"), ctrlArr = ctrl.array("bag");
+    const compMap = comp.map("kv"), ctrlMap = ctrl.map("kv");
+    for (let i = 0; i < CHURN; i++) {
+        const id = "id" + (Math.floor(frac(cprng) * CID));
+        const k = "k" + (Math.floor(frac(cprng) * CID));
+        const del = frac(cprng) < 0.7;
+        const mdel = frac(cprng) < 0.5;
+        compArr.add({ id, v: i }); ctrlArr.add({ id, v: i });
+        if (del) { compArr.deleteById(id); ctrlArr.deleteById(id); }
+        compMap.set(k, i); ctrlMap.set(k, i);
+        if (mdel) { compMap.delete(k); ctrlMap.delete(k); }
+        if ((i & 4095) === 4095) comp.compact(comp.versionVector());   // periodic reclamation
+    }
+    comp.compact(comp.versionVector());
+
+    const compRem = compArr._retention().removed;
+    const ctrlRem = ctrlArr._retention().removed;
+    check(compRem <= CID, () => `T7/C4: compacted removed census ${compRem} exceeds the live id bound ${CID}`);
+    check(compArr._retention().valueReg <= CID, () => `T7/C4: compacted valueReg ${compArr._retention().valueReg} exceeds the live id bound ${CID}`);
+    check(ctrlRem > compRem, () => `T7/C4: uncompacted control census ${ctrlRem} is not larger than the compacted ${compRem}`);
+    check(ctrlRem > CID, () => `T7/C4: uncompacted control census ${ctrlRem} should be O(ops), far above the live id bound ${CID}`);
+    // Observable convergence is untouched by compaction.
+    check(canon(comp) === canon(ctrl), () => "T7/C4: compaction changed the observable snapshot vs the uncompacted control");
+    validate(comp); validate(ctrl);
+
+    comp.dispose(); ctrl.dispose();
+    compactTracker.untrack(compH); compactTracker.untrack(ctrlH);
+    check(compactTracker.size() === 0, () => `T7/C4: leak tracker retained ${compactTracker.size()} docs after the compaction soak`);
 }

@@ -155,6 +155,13 @@ export interface DocState {
     cols: Record<string, unknown>;
 }
 
+/**
+ * A version vector: `replicaId -> max Lamport observed from that writer`. Produced
+ * by {@link CRDTDoc.versionVector} and consumed by {@link CRDTDoc.compact} and
+ * {@link CRDTDoc.getStateSince}. JSON-serializable.
+ */
+export type VersionVector = Record<string, number>;
+
 export interface CRDTDocOptions {
     /** Stable id for this replica. Auto-generated if omitted; an explicit, per-session-unique id is recommended. */
     replicaId?: string;
@@ -202,6 +209,30 @@ export interface CRDTDoc {
     getState(): DocState;
     /** Merge a remote full state (idempotent and commutative). */
     mergeState(state: DocState): void;
+    /**
+     * The doc's version vector (`replicaId -> max observed Lamport`), a
+     * prototype-free JSON-serializable snapshot copy. Hand it to a peer, which
+     * replies with {@link getStateSince} for a one-frame delta sync.
+     */
+    versionVector(): VersionVector;
+    /**
+     * Purely-local memory reclamation: drop every causally-stable tombstone (LWW
+     * delete, OR removed-tag, OR value register for a stable non-member) that every
+     * replica in the frontier `V` has observed. Emits nothing, adds no op type,
+     * changes no wire byte. `V` MUST be the pointwise-min version vector across ALL
+     * replicas; a frontier ahead of a lagging replica risks resurrection. A
+     * malformed `V` is reported to `onError` and reclaims nothing (never throws).
+     * Returns the count of entries reclaimed. See decisions/0004.
+     */
+    compact(V: VersionVector): number;
+    /**
+     * The {@link getState} shape filtered to just what a peer at version vector `V`
+     * has not yet seen (per-writer `l > V[r]`; counters ship full). A valid partial
+     * state consumed by the same {@link mergeState} door, so one delta frame
+     * converges a lagging peer. Empty `V` yields the full state; a malformed `V`
+     * fails closed to a full {@link getState}.
+     */
+    getStateSince(V: VersionVector): DocState;
     /** Subscribe to locally-generated ops, one call per op (forward these to your transport). Returns a disposer. */
     on(type: "op", cb: (op: Op) => void): () => void;
     /** Subscribe to batched local ops: one call per transaction (or a 1-op array per single edit). Returns a disposer. */

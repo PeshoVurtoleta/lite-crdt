@@ -4,6 +4,60 @@ All notable changes to `@zakkster/lite-crdt` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-09-02
+
+Tombstone compaction + delta sync (`decisions/0004-compaction-and-delta.md`). A
+FEATURE release, but a narrow one: the convergence algebra of the base CRDTs does
+NOT change, the wire format does NOT change (no new op type; `removed` still
+serializes as a lamport-less sorted array, byte-compatible with 1.2.x), and the
+C1 remote-op door and C2/C3 logic are EXTENDED, never rewritten. Compaction only
+RECLAIMS causally-stable tombstones and value registers -- state no future op can
+still need. A 1.3.0 replica and a 1.2.x replica still converge over plain ops and
+full-state sync; a 1.2.x peer simply never compacts.
+
+### Added
+
+- **`doc.versionVector()`** -- a prototype-free, JSON-serializable snapshot of the
+  doc's per-writer version vector (`replicaId -> max observed lamport`), safe to
+  hand a peer for a delta request.
+- **`doc.compact(V)`** -- PURELY LOCAL memory reclamation. Drops every
+  causally-stable tombstone (LWW delete, OR removed-tag, and the C2-retained OR
+  value register for a stable NON-member) that every replica in the frontier `V`
+  has already observed. Emits nothing, adds no op type, changes no wire byte.
+  Returns the count reclaimed. The safety condition is the CONSERVATIVE global
+  frontier `minAck = min(V.values())`: drop a tombstone with lamport `l` iff
+  `l <= minAck`. `V` MUST be the pointwise-min version vector across ALL replicas;
+  a malformed `V` is reported to `onError` and reclaims nothing (fail closed,
+  never throws).
+- **`doc.getStateSince(V)`** -- the `getState()` shape filtered to just what a
+  peer at version vector `V` has not yet seen (per-writer `l > V[r]`; counters
+  ship FULL, being small and max-idempotent). A valid PARTIAL state consumed by
+  the SAME `mergeState` door, so one delta frame converges a lagging peer instead
+  of a full state dump. `mergeState(getStateSince(V))` on a replica already at `V`
+  is a no-op; empty `V` yields the full state. A malformed `V` fails closed to a
+  full `getState()`.
+
+### Changed
+
+- The OR-Set `removed` tombstone set is now internally a `Map(tagKey ->
+  rmLamport)` (the removing op's lamport is the tombstone's causal-stability key).
+  It still SERIALIZES as the sorted key ARRAY -- no lamport crosses the wire, so
+  the format stays byte-identical to 1.2.x. Absorbing a 1.2.x lamport-less
+  `removed` array stamps each tag `MAX_LAMPORT - 1` (fail closed: unknown
+  provenance == not-yet-stable, never reclaimed early).
+- The doc maintains a version vector. The ONLY new per-op work is one in-place,
+  O(1), ZERO-ALLOCATION max-update on the already-validated `applyOp` scratch
+  (`observe(s.r, s.l)`); counters carry no lamport and never touch it. The T6
+  zero-alloc gate on `set`/`upd`/`cinc` is unaffected (major=0, minor=0).
+
+### Notes
+
+- Wire byte-compatible; convergence unchanged (proven byte-identical to an
+  uncompacted control by the t5 convergence fuzz and `test/16-compaction.test.mjs`).
+  The OR-Set value register is now reclaimable under causal stability -- exactly at
+  the seam decisions/0002 named for C4. `getState()` MAY legitimately shrink after
+  compaction (fewer tombstones); the observable `snapshot()` never changes.
+
 ## [1.2.1] - 2026-09-02
 
 Two S3 contract findings (`decisions/0003-undo-and-replica-identity.md`). The

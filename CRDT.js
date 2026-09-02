@@ -1,5 +1,5 @@
 /**
- * @zakkster/lite-crdt v1.2.1
+ * @zakkster/lite-crdt v1.3.0
  * --------------------------
  * Operational CRDTs for @zakkster/lite-store. Two convergent data types backed
  * by signal-reactive projections:
@@ -26,8 +26,17 @@
  * tags. `getState()/mergeState()` give state-based sync to hydrate a late
  * joiner in a single payload rather than replaying an unbounded op log.
  *
- * Out of scope for v1: RGA / positional sequence + reorder, rich text, and
- * vector-clock tombstone GC (tombstones and removed-tags accumulate).
+ * Tombstone compaction + delta sync (v1.3, decisions/0004): the doc tracks a
+ * per-replica version vector (`doc.versionVector()`). `doc.compact(V)` is PURELY
+ * LOCAL memory reclamation -- it drops the causally-stable tombstones (LWW
+ * deletes, OR removed-tags and OR value registers for stable non-members) that
+ * every replica in the supplied frontier V has already observed, emitting nothing
+ * and adding no op type. `doc.getStateSince(V)` returns a partial `getState()`
+ * carrying only what a peer at V has not yet seen -- consumed by the SAME
+ * `mergeState` door. These are COLD: the version-vector max-update is the only
+ * new per-op work and is O(1), zero-allocation, in place.
+ *
+ * Out of scope for v1: RGA / positional sequence + reorder and rich text.
  *
  * Public surface: {@link createCRDTDoc}, {@link connectBroadcastChannel},
  * {@link CRDTError}.
@@ -36,14 +45,14 @@
 import { store, unwrap, snapshot as storeSnapshot, dispose as disposeStore } from "@zakkster/lite-store";
 import { signal, dispose as disposeSignal, batch } from "@zakkster/lite-signal";
 
-/* ─── Errors ──────────────────────────────────────────────────────────────── */
+/* --- Errors ---------------------------------------------------------------- */
 
 /**
  * Typed error for programmer mistakes: collection kind mismatch, malformed op,
  * writing through a read-only projection, or a missing element id.
  */
 /** Package version. Kept in three-place sync with package.json and CHANGELOG.md. */
-export const VERSION = "1.2.1";
+export const VERSION = "1.3.0";
 
 export class CRDTError extends Error {
     constructor(code, message, opts) {
@@ -53,7 +62,7 @@ export class CRDTError extends Error {
     }
 }
 
-/* ─── Helpers ─────────────────────────────────────────────────────────────── */
+/* --- Helpers --------------------------------------------------------------- */
 
 /**
  * The Web Crypto source, resolved ONCE at module load so genReplicaId stays a
@@ -118,7 +127,7 @@ function cmpOK(aL, aR, bL, bR) {
 /**
  * Wrap a lite-store projection so the consumer can read (and stay reactive) but
  * cannot mutate it directly. Direct mutation would fire local UI reactivity
- * while bypassing the CRDT entirely — no op emitted, instant divergence. Reads
+ * while bypassing the CRDT entirely -- no op emitted, instant divergence. Reads
  * delegate to the underlying store proxy, preserving fine-grained tracking.
  */
 const ARRAY_MUTATORS = new Set(["push", "pop", "shift", "unshift", "splice", "sort", "reverse", "fill", "copyWithin"]);
@@ -127,7 +136,7 @@ const ARRAY_MUTATORS = new Set(["push", "pop", "shift", "unshift", "splice", "so
  * The guard has to be DEEP. A one-level proxy only protects the top object: the
  * `get` trap hands back the child store proxy raw, so `map.store.cfg.theme = x`
  * sails straight through, mutates CRDT state, fires local UI reactivity and
- * emits NO op — the exact silent divergence the guard exists to prevent.
+ * emits NO op -- the exact silent divergence the guard exists to prevent.
  *
  * Nested views are cached in a WeakMap so identity is stable across reads
  * (`s.cfg === s.cfg`) and a hot render loop re-wraps nothing.
@@ -165,7 +174,7 @@ function readOnlyView(proj, isArray, label) {
     return { view: new Proxy(proj, handler), wrap };
 }
 
-/* ─── LWW-Map ─────────────────────────────────────────────────────────────── */
+/* --- LWW-Map --------------------------------------------------------------- */
 
 /**
  * @param {string} name
@@ -184,7 +193,7 @@ function createLWWMap(name, ctx) {
     function apply(op) {
         // "__proto__" cannot be stored: `proj["__proto__"] = v` retargets the
         // projection's prototype instead of creating an own key, so the write
-        // evaporates — get() returns {}, keys() never lists it, and getState()
+        // evaporates -- get() returns {}, keys() never lists it, and getState()
         // drops it too. Ignoring it here (rather than throwing) keeps a remote
         // peer from being able to crash us with one crafted op; the LOCAL set()
         // path throws instead, so an app author finds out immediately.
@@ -256,8 +265,49 @@ function createLWWMap(name, ctx) {
             const op = del ? { t: "del", k, l, r } : { t: "set", k, l, r, v };
             apply(op);
             if (l > maxL) maxL = l;   // count every VALIDATED lamport, win or lose (symmetric with applyOp)
+            ctx.observe(r, l);        // advance the doc's version vector for writer r (C4)
         }
         return maxL;
+    }
+
+    /**
+     * COLD: drop causally-stable tombstones (decisions/0004). A LWW delete with
+     * order (l, r) is stable -- droppable -- once every replica has observed it,
+     * which the CONSERVATIVE global frontier `minAck = min(V.values())` proves:
+     * `l <= minAck` implies every replica saw the delete AND any competing set
+     * (with a strictly lower lamport) is itself stable (already delivered and
+     * already lost to the tombstone), so no future op the tombstone was needed to
+     * arbitrate can still arrive. Live registers (value writes) are NEVER dropped
+     * here -- only tombstones. Returns the count reclaimed. O(entries).
+     */
+    function compact(minAck) {
+        let n = 0;
+        for (const [k, rec] of entries) {
+            if (rec.del && rec.l <= minAck) { entries.delete(k); n++; }   // deleting the current key mid-iteration is safe on a Map
+        }
+        return n;
+    }
+
+    /**
+     * COLD: the getState() shape filtered to registers a peer at version vector V
+     * has NOT already seen -- `rec.l > V[rec.r]` for the writing replica r. A valid
+     * (partial) map state the SAME mergeState door validates and unions. Cold path.
+     */
+    // V is the doc's already-validated, prototype-free version-vector SNAPSHOT
+    // (snapshotVector, C-18) -- a static plain object, never the live untrusted V,
+    // so each `V[rec.r]` here is a safe single read. rec.r is the register's own
+    // writer (the deleter, for a tombstone) -- recoverable, so this per-writer
+    // filter is sound for a per-peer delta.
+    function getStateSince(V) {
+        const e = Object.create(null);
+        const ks = [...entries.keys()].sort();
+        for (let i = 0; i < ks.length; i++) {
+            const rec = entries.get(ks[i]);
+            const sv = V[rec.r];
+            const seen = typeof sv === "number" ? sv : 0;
+            if (rec.l > seen) e[ks[i]] = rec.del ? [rec.l, rec.r, 1] : [rec.l, rec.r, 0, rec.v];
+        }
+        return { kind: "map", entries: e };
     }
 
     return {
@@ -268,7 +318,7 @@ function createLWWMap(name, ctx) {
         get size() { rev(); return Object.keys(unwrap(proj)).length; },
         // SORTED, not insertion-ordered. Two replicas that converge on the same
         // key/value pairs still learn those keys in different orders, so raw
-        // insertion order disagreed across replicas on 385/400 fuzz seeds — a
+        // insertion order disagreed across replicas on 385/400 fuzz seeds -- a
         // list rendered from entries() would sit in a different order per peer.
         // Sorting is what makes the public read APIs replica-independent.
         keys() { rev(); return Object.keys(unwrap(proj)).sort(); },
@@ -278,7 +328,7 @@ function createLWWMap(name, ctx) {
             if (typeof k !== "string") k = String(k);
             if (k === "__proto__") {
                 throw new CRDTError("misconfigured",
-                    "'__proto__' cannot be used as a map key — it would be silently dropped. Prefix or rename the key.");
+                    "'__proto__' cannot be used as a map key -- it would be silently dropped. Prefix or rename the key.");
             }
             // tick() BEFORE record(): tick can throw at the clock ceiling, and a
             // failed write must not leave a phantom inverse in the undo ring.
@@ -298,7 +348,7 @@ function createLWWMap(name, ctx) {
             if (typeof k !== "string") k = String(k);
             if (k === "__proto__") {
                 throw new CRDTError("misconfigured",
-                    "'__proto__' cannot be used as a map key — it would be silently dropped. Prefix or rename the key.");
+                    "'__proto__' cannot be used as a map key -- it would be silently dropped. Prefix or rename the key.");
             }
             // tick() BEFORE record(): a ceiling throw must not leave a phantom inverse.
             const l = ctx.tick();
@@ -323,12 +373,14 @@ function createLWWMap(name, ctx) {
         },
         _apply: apply,
         _getState: getState,
+        _getStateSince: getStateSince,
         _mergeState: mergeState,
+        _compact: compact,
         _dispose() { disposeStore(proj); disposeSignal(rev); entries.clear(); },
     };
 }
 
-/* ─── OR-Set ──────────────────────────────────────────────────────────────── */
+/* --- OR-Set ---------------------------------------------------------------- */
 
 /**
  * @param {string} name
@@ -339,7 +391,11 @@ function createORSet(name, opts, ctx) {
     const identify = (opts && opts.identify) || ((v) => (v == null ? undefined : v.id));
 
     const adds = new Map();      // id -> Map(tagKey -> lamport)  : live membership tags
-    const removed = new Set();   // tagKeys tombstoned (observed-remove)
+    const removed = new Map();   // tagKey -> rmLamport           : tombstoned tags (observed-remove).
+                                 // The lamport is the removing op's `l`; it is what a version-vector
+                                 // frontier compares against to decide the tombstone is causally
+                                 // stable (decisions/0004). SERIALIZES as the sorted key array only
+                                 // (wire byte-compatible with <=1.2.x -- no lamport crosses the wire).
     const valueReg = new Map();  // id -> { l, r, v }             : LWW value register
     const order = [];            // ids in deterministic display order
     // Cached order key (min live tag) per member id, as scalars, so ordering
@@ -376,7 +432,7 @@ function createORSet(name, opts, ctx) {
         let bl = Infinity, br = "";
         for (const [tagKey, l] of tags) {
             // tagKey is `replicaId + "#" + tagCounter`. The counter is a number and
-            // can never contain "#", but a replicaId can — "team#alice" and
+            // can never contain "#", but a replicaId can -- "team#alice" and
             // "team#bob" both parsed to "team" under indexOf, collapsing two
             // distinct replicas onto one order key and inverting list order
             // between peers. Split on the LAST "#" so any replicaId is safe.
@@ -469,7 +525,12 @@ function createORSet(name, opts, ctx) {
             let changed = false;
             for (let i = 0; i < op.g.length; i++) {
                 const tagKey = op.g[i];
-                removed.add(tagKey);
+                // Record the removing op's lamport as the tombstone's stability key.
+                // Any remover observed the tag before removing it, so op.l is strictly
+                // above the tag's add lamport -- a frontier that covers op.l therefore
+                // covers the add too (decisions/0004). Last-write-wins on re-remove is
+                // fine: every stored value is some remover's l, all > the add lamport.
+                removed.set(tagKey, op.l);
                 if (tags !== undefined && tags.delete(tagKey)) changed = true;
             }
             if (changed) recomputeOK(id);
@@ -554,7 +615,9 @@ function createORSet(name, opts, ctx) {
             const rec = valueReg.get(id);
             vals[id] = [rec.l, rec.r, rec.v];
         }
-        return { kind: "set", adds: a, removed: Array.from(removed).sort(), values: vals };
+        // removed serializes as the SORTED KEY array (no lamport) -- byte-identical
+        // to the <=1.2.x wire (C4 keeps `removed` a lamport-less array on the wire).
+        return { kind: "set", adds: a, removed: [...removed.keys()].sort(), values: vals };
     }
 
     // Returns the MAX lamport absorbed across every live tag AND every value
@@ -567,7 +630,17 @@ function createORSet(name, opts, ctx) {
         // Union removed tombstones first so resurrected tags are suppressed.
         const rem = s.removed;
         if (Array.isArray(rem)) {
-            for (let i = 0; i < rem.length; i++) { const tk = rem[i]; if (typeof tk === "string") removed.add(tk); }
+            // The wire carries `removed` as a lamport-less array (byte-compatible
+            // with a 1.2.x peer). An absorbed tag of unknown provenance is stamped
+            // MAX_LAMPORT-1 so it is NEVER treated as causally stable / dropped early
+            // -- fail closed: unknown provenance == just-seen, not-yet-stable
+            // (decisions/0004). A real `rm` op (apply, above) or a later merge that
+            // carried a genuine lamport already put the true value here; do not
+            // clobber it with the default.
+            for (let i = 0; i < rem.length; i++) {
+                const tk = rem[i];
+                if (typeof tk === "string" && !removed.has(tk)) removed.set(tk, MAX_LAMPORT - 1);
+            }
         }
         // Union add tags (minus tombstoned); validate each tag lamport at use.
         const sadds = s.adds;
@@ -580,6 +653,7 @@ function createORSet(name, opts, ctx) {
                 for (const tagKey in incoming) {
                     const l = incoming[tagKey];
                     if (typeof l !== "number" || !Number.isFinite(l) || l >= MAX_LAMPORT) continue;
+                    ctx.observe(tagKey.slice(0, tagKey.lastIndexOf("#")), l);   // advance vv for the tag's writer (C4)
                     if (!removed.has(tagKey)) { tags.set(tagKey, l); if (l > maxL) maxL = l; }
                 }
             }
@@ -602,6 +676,7 @@ function createORSet(name, opts, ctx) {
                 if (typeof l !== "number" || !Number.isFinite(l) || l >= MAX_LAMPORT || typeof r !== "string") continue;
                 setValue(id, l, r, v);
                 if (l > maxL) maxL = l;
+                ctx.observe(r, l);   // advance vv for the value register's writer (C4)
             }
         }
         // Consistency, checked against the ACTUAL merged Maps (immune to TOCTOU):
@@ -616,6 +691,80 @@ function createORSet(name, opts, ctx) {
         }
         rebuildProjection();
         return maxL;
+    }
+
+    /**
+     * COLD: reclaim causally-stable state (decisions/0004) against the conservative
+     * global frontier `minAck = min(V.values())`:
+     *   - a `removed` tombstone with rmLamport `l` is dropped when `l <= minAck` --
+     *     every replica has observed the removal (so no peer still holds the tag as
+     *     a live add) AND the tag's earlier add is itself stable (`addL < l <= minAck`),
+     *     so no delivery can reintroduce the tag;
+     *   - a `valueReg` entry is dropped only for a NON-member id whose register write
+     *     `l <= minAck` -- the C2-retained register finally goes, because a stable
+     *     register cannot be beaten by any op that can still arrive (a peer that saw
+     *     it emits only higher lamports; an older competing write is itself stable and
+     *     already lost), and the id is not a live member, so no read needs its value.
+     * Purely local: emits nothing, no op type, no wire change. Returns count reclaimed.
+     */
+    function compact(minAck) {
+        let n = 0;
+        for (const [tk, l] of removed) if (l <= minAck) { removed.delete(tk); n++; }
+        for (const [id, rec] of valueReg) if (rec.l <= minAck && !isMember(id)) { valueReg.delete(id); n++; }
+        return n;
+    }
+
+    /**
+     * COLD: the getState() shape filtered to what a peer at version vector V has NOT
+     * seen. A tag is included when its add lamport `l > V[adderR]` (adderR parsed off
+     * the tagKey -- recoverable, so per-writer filtering is sound); a value register
+     * when `rec.l > V[rec.r]` (rec.r is the register's own writer -- recoverable).
+     *
+     * `removed` is emitted IN FULL -- every tombstone, exactly as getState() does. It
+     * MUST NOT be filtered against V: a tombstone is keyed by a tagKey that carries
+     * only the tag's ADD-writer, never the REMOVE-writer, so V (a single peer's per-
+     * writer frontier) cannot certify the peer has seen the removal. A peer caught up
+     * on the add-writer but never told of the remove-writer would silently lose a
+     * needed tombstone and RESURRECT the element (permanent divergence, no onError).
+     * Shipping extra tombstones a peer already has is idempotent/harmless in the
+     * union merge; omitting a needed one is fatal. (The conservative global `minAck`
+     * frontier is valid ONLY for compact(), where V is the pointwise-min across ALL
+     * replicas -- not here.) A valid (partial) set state the SAME mergeState door
+     * validates and unions. Cold path. V is the doc's already-validated,
+     * prototype-free version-vector SNAPSHOT (snapshotVector, C-18) -- a static plain
+     * object, never the live untrusted V, so each `V[r]` below is a safe single read
+     * and the delta cannot be made internally inconsistent by a live accessor.
+     */
+    function getStateSince(V) {
+        const a = Object.create(null);
+        const addIds = [...adds.keys()].sort();
+        for (let i = 0; i < addIds.length; i++) {
+            const id = addIds[i];
+            const tags = adds.get(id);
+            if (tags.size === 0) continue;
+            let m = null;
+            const tagKeys = [...tags.keys()].sort();
+            for (let j = 0; j < tagKeys.length; j++) {
+                const tk = tagKeys[j];
+                const l = tags.get(tk);
+                const r = tk.slice(0, tk.lastIndexOf("#"));   // the tag's ADD-writer -- recoverable, so per-writer filtering is sound
+                const sv = V[r];
+                const seen = typeof sv === "number" ? sv : 0;
+                if (l > seen) { if (m === null) m = Object.create(null); m[tk] = l; }
+            }
+            if (m !== null) a[id] = m;
+        }
+        const rem = [...removed.keys()].sort();   // FULL tombstone set -- see above; NEVER filter by V
+        const vals = Object.create(null);
+        const valIds = [...valueReg.keys()].sort();
+        for (let i = 0; i < valIds.length; i++) {
+            const id = valIds[i];
+            const rec = valueReg.get(id);
+            const sv = V[rec.r];
+            const seen = typeof sv === "number" ? sv : 0;
+            if (rec.l > seen) vals[id] = [rec.l, rec.r, rec.v];
+        }
+        return { kind: "set", adds: a, removed: rem, values: vals };
     }
 
     /** Recompute order + projection array from scratch (used by mergeState). */
@@ -654,7 +803,9 @@ function createORSet(name, opts, ctx) {
         snapshot() { return storeSnapshot(unwrap(proj)); },
         _apply: apply,
         _getState: getState,
+        _getStateSince: getStateSince,
         _mergeState: mergeState,
+        _compact: compact,
         // Test-only retention probe (C-10): live-map cardinalities that getState()
         // cannot reveal (it filters emptied tag Maps out). `adds` must track live
         // members, never O(ops); `valueReg` is deliberately retained per id.
@@ -663,7 +814,7 @@ function createORSet(name, opts, ctx) {
     };
 }
 
-/* ─── PN-Counter ──────────────────────────────────────────────────────────── */
+/* --- PN-Counter ------------------------------------------------------------ */
 
 /**
  * Positive-Negative counter: two grow-only maps (per-replica cumulative
@@ -796,12 +947,16 @@ function createPNCounter(name, ctx) {
         snapshot() { return val.peek(); },
         _apply: apply,
         _getState: getState,
+        // PN-Counters carry no Lamport clock and no tombstones: nothing is ever
+        // causally stale to reclaim, and a delta ships them FULL (P/N are small and
+        // max-idempotent, so always-include is correct and simplest -- decisions/0004).
+        _compact() { return 0; },
         _mergeState: mergeState,
         _dispose() { disposeSignal(val); P.clear(); N.clear(); },
     };
 }
 
-/* ─── The remote-op validation door (reject-and-continue) ─────────────────── */
+/* --- The remote-op validation door (reject-and-continue) ------------------- */
 
 /**
  * Clock ceiling. At/above 2^53, `++lamport` is a float no-op and the (lamport,
@@ -866,7 +1021,51 @@ function okState(cs, kind) {
         cs.values !== null && typeof cs.values === "object";
 }
 
-/* ─── Document ────────────────────────────────────────────────────────────── */
+/**
+ * Read an untrusted version vector (a plain `{ replicaId: lamport }` object, e.g.
+ * one that arrived off the wire for a delta request) ONCE into a validated,
+ * prototype-free snapshot -- the SAME single-read-into-validated-scratch discipline
+ * decisions/0001 (C-18) established for the op/state door. Each field of V is read
+ * EXACTLY ONCE, validated inline (a finite, non-negative lamport strictly below the
+ * clock ceiling), and copied into the snapshot; compact()/getStateSince() then
+ * consult ONLY the snapshot, never the live V again. This closes the TOCTOU a
+ * live-accessor V (a getter or Proxy) would otherwise open: a second, independent
+ * traversal (validate-here-then-re-read-at-use) would let V return a benign value
+ * to the validator and a poison one to `minAckOf` / the `V[r]` filters, dropping a
+ * tombstone it must not. Fail closed: a malformed vector (not an object, an array,
+ * a `__proto__` key, or any non-finite/negative/over-ceiling value) yields `null`
+ * -- the whole vector is rejected, never a partial. Cold path -- runs once per
+ * compact()/getStateSince() call.
+ */
+function snapshotVector(V) {
+    if (V === null || typeof V !== "object" || Array.isArray(V)) return null;   // a vector is a { replicaId: lamport } map, never an array
+    const out = Object.create(null);
+    for (const r in V) {
+        if (r === "__proto__") return null;                 // fail closed: a __proto__ replicaId is garbage/attack
+        const n = V[r];                                     // read each field EXACTLY ONCE (C-18)
+        if (typeof n !== "number" || !Number.isFinite(n) || n < 0 || n >= MAX_LAMPORT) return null;
+        out[r] = n;                                         // freeze the validated value into the snapshot
+    }
+    return out;
+}
+
+/**
+ * The CONSERVATIVE global compaction frontier: the pointwise-min lamport across a
+ * version-vector SNAPSHOT (already validated + frozen by snapshotVector, so every
+ * value here is a plain finite number -- no live re-read). `min(V.values())`, or 0
+ * when V is empty -- an empty
+ * frontier acknowledges nothing, so nothing is stable (`l <= 0` is never true for a
+ * real lamport). Dropping state at `l <= minAck` is SAFE because minAck <= V[r] for
+ * every r, so it implies the per-replica seen-by-all condition for every writer at
+ * once (decisions/0004). Cold path.
+ */
+function minAckOf(V) {
+    let m = Infinity, any = false;
+    for (const r in V) { const n = V[r]; if (typeof n === "number") { any = true; if (n < m) m = n; } }
+    return (any && Number.isFinite(m)) ? m : 0;
+}
+
+/* --- Document -------------------------------------------------------------- */
 
 /**
  * Create a CRDT document: a namespace of convergent collections sharing one
@@ -905,6 +1104,15 @@ export function createCRDTDoc(options) {
     // (replicaId#counter) never collide for this writer.
     let tagCounter = 0;
 
+    // Version vector: replicaId -> max lamport this doc has observed from that
+    // writer (C4). It is the frontier compact()/getStateSince() reason about. The
+    // ONLY new per-op work is `observe`: an O(1), zero-allocation in-place max on an
+    // ALREADY-VALIDATED (r, l) -- the Map grows only on a genuinely new replicaId
+    // (bounded by replica count, not op count), so steady state allocates nothing
+    // (the T6 gate). Counters carry no lamport (l is undefined) and never touch vv.
+    const vv = new Map();
+    const observe = (r, l) => { if (typeof l === "number" && l > (vv.get(r) || 0)) vv.set(r, l); };
+
     // Fail closed at the clock ceiling: rather than silently saturate (at/above
     // 2^53 `++lamport` is a float no-op and causal order collapses, C-07), throw
     // so the caller learns the doc can no longer order writes.
@@ -913,17 +1121,19 @@ export function createCRDTDoc(options) {
             throw new CRDTError("clock_ceiling",
                 "Lamport clock reached the 2^53 ceiling; the doc can no longer order writes.");
         }
-        return ++lamport;
+        lamport++;
+        observe(replicaId, lamport);   // a local write advances this replica's own vv entry
+        return lamport;
     };
     tick.counter = () => tagCounter++;
 
-    // ── Transactions ──
+    // -- Transactions --
     // transact(fn) buffers every op emitted during fn and flushes them as ONE
     // op-array payload (one 'ops' event => one network frame => one applyOps on
     // the far side), and coalesces the reactive `change` into a single fire.
     const txn = { depth: 0, ops: [], pendingChange: false };
 
-    // ── Local undo/redo ──
+    // -- Local undo/redo --
     // Since ops are explicit, the inverse of a LOCAL edit is cheap to record.
     // `into` is the ring the next recorded inverse lands in ("undo" normally,
     // "redo" while replaying an undo, "undo" while replaying a redo). `busy` is
@@ -945,6 +1155,7 @@ export function createCRDTDoc(options) {
     const ctx = {
         replicaId,
         tick,
+        observe,  // collections advance the version vector for every register/tag lamport they absorb (C4)
         report,   // collections route a dropped-at-use malformed state entry here
         recording: undoDepth > 0,
         emit(op) {
@@ -1090,6 +1301,12 @@ export function createCRDTDoc(options) {
             }
             // Lamport merge: a later local event will exceed any observed op.
             if (typeof s.l === "number" && s.l > lamport) lamport = s.l;
+            // Version-vector max-update (C4): the ONLY new per-op work. In place,
+            // O(1), zero-allocation on the validated scratch fields (a Map.set of an
+            // existing replicaId key allocates nothing; a brand-new writer grows the
+            // Map once, bounded by replica count). Counter ops carry no `l`
+            // (s.l undefined), so `observe` skips them -- vv tracks lamport only.
+            observe(s.r, s.l);
             const col = getCollection(s.c, kind);
             col._apply(s);
         },
@@ -1153,6 +1370,66 @@ export function createCRDTDoc(options) {
             }
         },
 
+        // -- Tombstone compaction + delta sync (C4, decisions/0004) --
+
+        // The doc's version vector: replicaId -> max lamport observed from that
+        // writer. A prototype-free, JSON-serializable snapshot COPY (safe to send a
+        // peer, who replies with getStateSince(thisVector)). Cold path.
+        versionVector() {
+            const out = Object.create(null);
+            for (const [r, l] of vv) out[r] = l;
+            return out;
+        },
+
+        // Purely-local memory reclamation: drop every causally-stable tombstone
+        // (LWW delete, OR removed-tag, OR value register for a stable non-member)
+        // that every replica in the frontier V has already observed. Emits NOTHING,
+        // introduces no op type, changes no wire format -- it only forgets state no
+        // future op can still need (decisions/0004). V MUST be the pointwise-min
+        // version vector across ALL replicas (each replica's versionVector(), mins'd
+        // per key); supplying a frontier ahead of some lagging replica would drop a
+        // tombstone that replica's concurrent op still needs to lose to -> silent
+        // resurrection. A malformed V is reported to onError and reclaims nothing
+        // (fail closed, never throws). Returns the count of entries reclaimed.
+        // V is UNTRUSTED: it is read ONCE into a validated, prototype-free snapshot
+        // (snapshotVector, the C-18 single-read discipline), and everything below --
+        // minAckOf and each collection's _compact -- consults ONLY that snapshot, so
+        // a live-accessor V cannot validate benign then re-read as poison (TOCTOU).
+        compact(V) {
+            if (disposed) return 0;
+            const vsnap = snapshotVector(V);
+            if (vsnap === null) {
+                report(new CRDTError("malformed_state", "compact() dropped a malformed version vector."));
+                return 0;
+            }
+            const minAck = minAckOf(vsnap);
+            let reclaimed = 0;
+            for (const [, col] of cols) reclaimed += col._compact(minAck);
+            return reclaimed;
+        },
+
+        // The getState() shape filtered to just what a peer at version vector V has
+        // NOT yet seen (per-writer `l > V[r]`; counters ship full -- they are small
+        // and max-idempotent). A valid (partial) state consumed by the SAME
+        // mergeState door, so `peerAtV.mergeState(this.getStateSince(V))` converges
+        // the peer to this replica in one delta frame instead of a full state dump.
+        // A malformed V fails closed to a FULL getState() (a superset is always safe)
+        // and is reported. Cold path. V is UNTRUSTED: read ONCE into a validated
+        // snapshot (snapshotVector, C-18); every per-record `V[r]` filter below reads
+        // that snapshot, never the live V, so the delta cannot be made internally
+        // inconsistent by a live-accessor V.
+        getStateSince(V) {
+            const vsnap = snapshotVector(V);
+            if (vsnap === null) report(new CRDTError("malformed_state", "getStateSince() got a malformed version vector; sending full state."));
+            const out = Object.create(null);
+            const names = [...cols.keys()].sort();
+            for (let i = 0; i < names.length; i++) {
+                const col = cols.get(names[i]);
+                out[names[i]] = (vsnap !== null && col._getStateSince) ? col._getStateSince(vsnap) : col._getState();
+            }
+            return { replicaId, clock: lamport, cols: out };
+        },
+
         on(type, cb) {
             if (typeof cb !== "function") throw new CRDTError("misconfigured", "on() requires a callback");
             const list = type === "op" ? opCbs : type === "ops" ? opsCbs : type === "change" ? changeCbs : null;
@@ -1184,6 +1461,7 @@ export function createCRDTDoc(options) {
             disposed = true;
             for (const [, col] of cols) col._dispose();
             cols.clear();
+            vv.clear();
             opCbs.length = 0;
             opsCbs.length = 0;
             changeCbs.length = 0;
@@ -1193,7 +1471,7 @@ export function createCRDTDoc(options) {
     };
 }
 
-/* ─── Optional transport: native BroadcastChannel (cross-tab) ─────────────── */
+/* --- Optional transport: native BroadcastChannel (cross-tab) --------------- */
 
 /**
  * Wire a document to a BroadcastChannel for zero-config cross-tab sync. Uses the

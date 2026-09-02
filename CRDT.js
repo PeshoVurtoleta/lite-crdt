@@ -1,6 +1,6 @@
 /**
- * @zakkster/lite-crdt v1.3.1
- * --------------------------
+ * @zakkster/lite-crdt v2.0.0
+ * ----------------------------------
  * Operational CRDTs for @zakkster/lite-store. Two convergent data types backed
  * by signal-reactive projections:
  *
@@ -52,7 +52,7 @@ import { signal, dispose as disposeSignal, batch } from "@zakkster/lite-signal";
  * writing through a read-only projection, or a missing element id.
  */
 /** Package version. Kept in three-place sync with package.json and CHANGELOG.md. */
-export const VERSION = "1.3.1";
+export const VERSION = "2.0.0";
 
 export class CRDTError extends Error {
     constructor(code, message, opts) {
@@ -814,6 +814,979 @@ function createORSet(name, opts, ctx) {
     };
 }
 
+/* --- RGA list (positional sequence) ---------------------------------------- */
+
+/**
+ * Replicated Growable Array: a positional sequence with a stable per-element
+ * identity (its BIRTH ANCHOR id `(l, r)`) and a deterministic, replica-
+ * independent linearization. State is two layers over one record:
+ *
+ *   - A doubly-linked ANCHOR chain rooted at an immutable HEAD sentinel. A node's
+ *     position is fixed forever the moment it integrates, by the RGA scan
+ *     (concurrent same-origin inserts descend by `(lamport, replicaId)`).
+ *   - A two-level id index `byR : Map(r -> Map(l -> node))` so remote apply is a
+ *     zero-string-concat lookup (`nodeAt`), never an `"r#l"` key build. String
+ *     anchor keys exist ONLY on the cold pending / (future) serialization paths.
+ *
+ * C5.3 surface: identity + `insert` + order + `delete` + `move`. An element is a
+ * record that OCCUPIES an anchor node (`node.e`); its stable identity is its BIRTH
+ * anchor `(bl, br)` and its birth node keeps a permanent `born` back-pointer, so
+ * the element is findable by identity even after it migrates. A delete is a
+ * MONOTONE `del` flag (once true, never false); the birth ANCHOR node stays linked
+ * and the value is spliced OUT of the projection.
+ *
+ * MOVE is a first-class LWW POSITION REGISTER `(ml, mr) -> anchor`, its value drawn
+ * from the anchor space -- NOT a reference to a live element, NOT delete+reinsert.
+ * `applyLmv` UNCONDITIONALLY mints + integrates a fresh anchor (with the move op's
+ * own `(l, r)`) at the destination origin -- so a concurrent insert naming this
+ * move's anchor as its origin still lands, win or lose -- and CONDITIONALLY writes
+ * the register under `tsWins(op.l, op.r, e.ml, e.mr)`: only a move that beats the
+ * element's current register stamp relinks the element to the newly minted anchor;
+ * a losing (lower-stamped) move leaves its minted anchor ABANDONED (occupying no
+ * element). The element's initial register stamp is its birth `(bl, br)`, and a
+ * move's lamport is always strictly greater (you must observe a birth to move it),
+ * so the first move always beats birth. Two concurrent moves of one element thus
+ * converge to ONE position (the tsWins winner) on every replica.
+ *
+ * Move || delete COMMUTE because they write DISJOINT fields (the monotone `del`
+ * flag vs the LWW register): a deleted element stays invisible regardless of any
+ * move, and a move never resurrects it. An `ldel`/`lmv` that arrives before its
+ * birth `lins` records a placeholder (born-dead / born-moved) keyed by the birth
+ * anchor, reconciled when the `lins` integrates. An `lmv` whose destination origin
+ * anchor is unseen PENDS on the shared origin buffer, exactly like an `lins`.
+ *
+ * C5.4 adds full serialization + delta + two-tier compaction. Each node stores its
+ * ORIGIN (or, ol) so `_getState`/`_mergeState` round-trip the sequence:
+ * `_mergeState` re-runs integration from origins in ascending (l, r) (never trusting
+ * a transmitted sibling order; an orphan whose origin never arrives is dropped +
+ * reported). `_getStateSince(V)` ships a node when `node.l > V[r]` and an element
+ * when any of its three OWN-writer stamps (birth, move register, remover) beats V.
+ * `_compact(minAck, quiesced)` drops causally-stable deleted element records (Tier 1)
+ * and, only under caller-proven global quiescence, unlinks unoccupied anchors (Tier 2).
+ *
+ * @param {string} name
+ * @param {{tick:()=>number, replicaId:string, emit:(op)=>void, changed:()=>void, report:(e)=>void}} ctx
+ */
+function createRGAList(name, ctx) {
+    // Immutable HEAD sentinel: every insert with `or === null` integrates after it.
+    // `e === null` marks a non-element node (only the head has one, in C5.1).
+    const head = { l: 0, r: "", prev: null, next: null, e: null };
+    const byR = new Map();       // r -> Map(l -> node) : two-level id index (no string keys)
+    let count = 0;               // live elements (not tombstoned)
+    const proj = store([]);
+    const { view: ro, wrap: roWrap } = readOnlyView(proj, true, "list('" + name + "').store");
+    const rev = signal(0);
+    const bump = () => rev.set(rev.peek() + 1);
+
+    // Pending origin buffer: an `lins` whose origin anchor is not yet integrated
+    // is held here (keyed by the ORIGIN anchor "or#ol"), drained when that anchor
+    // arrives. Dropping instead would diverge under reorder. COLD path only -- the
+    // string key here never touches steady-state apply. Capped: an overflow is a
+    // crafted-frame DoS, so it fails closed (report + drop), never grows unbounded.
+    const PENDING_MAX = 4096;
+    const pending = new Map();    // "or#ol" -> array of frozen op copies
+    let pendingCount = 0;
+
+    // Delete-before-insert placeholder tombstones: an `ldel` whose birth `lins`
+    // has not yet integrated is recorded here, keyed by the BIRTH anchor (two-level
+    // Map(br -> Map(bl -> {dl, dr})), no string keys), carrying the remover stamp
+    // (dl, dr). When the birth `lins` finally integrates, applyLins reconciles it as
+    // ALREADY-DELETED (born-dead) on every replica, so a delete can never lose to a
+    // late insert (monotone del wins). Keyed by identity, so a re-delivered ldel is
+    // an O(1) no-op (dedup is free here) -- it consumes a placeholder slot ONCE.
+    // Shares the PENDING_MAX budget + `pendingCount` with the origin buffer so a
+    // crafted-ldel flood for never-arriving births fails closed the same way. COLD
+    // path only. Counted in _retention().pending.
+    const delPending = new Map();   // br -> Map(bl -> { dl, dr })
+
+    // Move-before-insert placeholder registers (born-moved): an `lmv` whose target
+    // element's birth `lins` has not yet integrated is recorded here, keyed by the
+    // BIRTH anchor (two-level Map(br -> Map(bl -> {ml, mr})), no string keys),
+    // carrying the WINNING move stamp (higher (l, r) wins on convergence, so
+    // concurrent born-moved moves of one element agree on the stored stamp). The
+    // move's destination anchor was already minted (step 1 runs only after the
+    // origin resolves), so it is recoverable as nodeAt(mr, ml). When the birth
+    // `lins` integrates, applyLins relinks the newborn to that anchor. Shares the
+    // PENDING_MAX budget + `pendingCount`, so a crafted-lmv flood for never-arriving
+    // births fails closed the same way. COLD path only. Counted in _retention().pending.
+    const mvPending = new Map();   // br -> Map(bl -> { ml, mr })
+
+    // Two-level lookup. ZERO string concatenation -- the hot apply path calls this.
+    function nodeAt(r, l) {
+        const inner = byR.get(r);
+        if (inner === undefined) return undefined;
+        return inner.get(l);
+    }
+
+    // RGA integration: from the origin, skip every node whose order key is STRICTLY
+    // GREATER than the new node's (concurrent same-origin inserts thus descend by
+    // (lamport, replicaId)), then link the node before the first that is not. Pure
+    // pointer writes; the only allocation is the node itself (in `applyLins`).
+    function integrate(node, origin) {
+        let prev = origin;
+        let x = origin.next;
+        while (x !== null && cmpOK(x.l, x.r, node.l, node.r) > 0) { prev = x; x = x.next; }
+        node.prev = prev;
+        node.next = x;
+        prev.next = node;
+        if (x !== null) x.prev = node;
+    }
+
+    // Visible (live-element) index of a node: count live elements strictly before
+    // it in the chain. The projection mirrors live-chain order, so this is the
+    // exact splice position. O(n); runs only on first delivery / local emit (COLD).
+    function visIndexOf(node) {
+        let i = 0;
+        let x = head.next;
+        while (x !== null && x !== node) {
+            if (x.e !== null && !x.e.del) i++;
+            x = x.next;
+        }
+        return i;
+    }
+
+    // The node holding the `vi`-th live element (0-based), or HEAD if none.
+    function liveNodeAtVisible(vi) {
+        let i = 0;
+        let x = head.next;
+        while (x !== null) {
+            if (x.e !== null && !x.e.del) {
+                if (i === vi) return x;
+                i++;
+            }
+            x = x.next;
+        }
+        return head;
+    }
+
+    // The node holding the `vi`-th live element, counting the live sequence WITH the
+    // `skip` node excluded, or HEAD if none. Used by the LOCAL move() to resolve the
+    // destination origin under the "toIndex is the post-removal index" convention.
+    function liveNodeAtVisibleSkipping(vi, skip) {
+        let i = 0;
+        let x = head.next;
+        while (x !== null) {
+            if (x.e !== null && !x.e.del && x !== skip) {
+                if (i === vi) return x;
+                i++;
+            }
+            x = x.next;
+        }
+        return head;
+    }
+
+    // Hold an origin-dependent list op (`lins` or `lmv`) whose destination origin
+    // anchor is unseen. COLD path -- `op` may be the reused scratchOp, so freeze a
+    // COPY (never a reference). Fail closed on overflow.
+    function pushPending(op) {
+        if (pendingCount >= PENDING_MAX) {
+            ctx.report(new CRDTError("malformed_state",
+                "list('" + name + "') pending-origin buffer is full (" + PENDING_MAX + "); dropping a list op whose origin never arrived."));
+            return;
+        }
+        const key = op.or + "#" + op.ol;
+        let arr = pending.get(key);
+        if (arr === undefined) { arr = []; pending.set(key, arr); }
+        arr.push(op.t === "lmv"
+            ? Object.freeze({ t: "lmv", c: name, l: op.l, r: op.r, bl: op.bl, br: op.br, or: op.or, ol: op.ol })
+            : Object.freeze({ t: "lins", c: name, l: op.l, r: op.r, or: op.or, ol: op.ol, v: op.v }));
+        pendingCount++;
+    }
+
+    // Drain every origin-dependent op that was waiting on the anchor (r, l) just
+    // integrated, dispatching each by its type.
+    function drainPending(r, l) {
+        const key = r + "#" + l;
+        const arr = pending.get(key);
+        if (arr === undefined) return;
+        pending.delete(key);
+        pendingCount -= arr.length;
+        for (let i = 0; i < arr.length; i++) {
+            const p = arr[i];
+            if (p.t === "lmv") applyLmv(p); else applyLins(p);
+        }
+    }
+
+    // Two-level placeholder lookup for a delete-before-insert. Zero string concat.
+    function delPendingAt(br, bl) {
+        const inner = delPending.get(br);
+        if (inner === undefined) return undefined;
+        return inner.get(bl);
+    }
+
+    // Record (or converge) a placeholder tombstone for an as-yet-unborn element.
+    // COLD path. Idempotent by BIRTH identity: a re-delivered ldel finds the
+    // existing slot and only converges the remover stamp (higher (l, r) wins, so
+    // concurrent deletes of the same element agree on the stored stamp on every
+    // replica), never consuming a second slot. Fails closed on overflow.
+    function markDelPending(br, bl, dl, dr) {
+        let inner = delPending.get(br);
+        if (inner !== undefined) {
+            const cur = inner.get(bl);
+            if (cur !== undefined) {
+                if (tsWins(dl, dr, cur.dl, cur.dr)) { cur.dl = dl; cur.dr = dr; }
+                return;   // already tombstoned for this birth: no new slot
+            }
+        }
+        if (pendingCount >= PENDING_MAX) {
+            ctx.report(new CRDTError("malformed_state",
+                "list('" + name + "') pending buffer is full (" + PENDING_MAX + "); dropping an ldel whose birth never arrived."));
+            return;
+        }
+        if (inner === undefined) { inner = new Map(); delPending.set(br, inner); }
+        inner.set(bl, { dl, dr });
+        pendingCount++;
+    }
+
+    // Drop the placeholder tombstone for a birth anchor once its `lins` integrates.
+    function clearDelPending(br, bl) {
+        const inner = delPending.get(br);
+        if (inner === undefined) return;
+        if (inner.delete(bl)) {
+            pendingCount--;
+            if (inner.size === 0) delPending.delete(br);
+        }
+    }
+
+    // Two-level placeholder lookup for a move-before-insert. Zero string concat.
+    function mvPendingAt(br, bl) {
+        const inner = mvPending.get(br);
+        if (inner === undefined) return undefined;
+        return inner.get(bl);
+    }
+
+    // Record (or converge) a born-moved placeholder register for an as-yet-unborn
+    // element. COLD path. Idempotent by BIRTH identity: a re-delivered or concurrent
+    // born-moved lmv finds the existing slot and keeps the HIGHER (l, r) stamp (so
+    // every replica agrees which move wins when the birth arrives), never consuming a
+    // second slot. Fails closed on overflow (shared PENDING_MAX budget).
+    function markMvPending(br, bl, ml, mr) {
+        let inner = mvPending.get(br);
+        if (inner !== undefined) {
+            const cur = inner.get(bl);
+            if (cur !== undefined) {
+                if (tsWins(ml, mr, cur.ml, cur.mr)) { cur.ml = ml; cur.mr = mr; }
+                return;   // already pending for this birth: no new slot
+            }
+        }
+        if (pendingCount >= PENDING_MAX) {
+            ctx.report(new CRDTError("malformed_state",
+                "list('" + name + "') pending buffer is full (" + PENDING_MAX + "); dropping an lmv whose birth never arrived."));
+            return;
+        }
+        if (inner === undefined) { inner = new Map(); mvPending.set(br, inner); }
+        inner.set(bl, { ml, mr });
+        pendingCount++;
+    }
+
+    // Drop the born-moved placeholder for a birth anchor once its `lins` integrates.
+    function clearMvPending(br, bl) {
+        const inner = mvPending.get(br);
+        if (inner === undefined) return;
+        if (inner.delete(bl)) {
+            pendingCount--;
+            if (inner.size === 0) mvPending.delete(br);
+        }
+    }
+
+    // Apply an lins op (from a remote frame, a drained pending copy, or the local
+    // emit path). Idempotent: a redelivered anchor short-circuits with NO scan and
+    // NO allocation (the T6 steady-state path). First delivery allocates one node.
+    function applyLins(op) {
+        // `op` may BE the doc-owned scratchOp on the remote path, and it is reused
+        // by any reentrant applyOp a 'change' listener fires. Read every scratch
+        // field into a local BEFORE ctx.changed() (which can trigger that reentrancy)
+        // -- especially the node's own anchor (nr, nl), consumed post-change by
+        // drainPending. A stale re-read there would drain the WRONG anchor and strand
+        // this node's dependents forever (silent divergence, no onError).
+        const nr = op.r, nl = op.l;
+        if (nodeAt(nr, nl) !== undefined) return true;   // already integrated -- idempotent no-op
+        const or = op.or, ol = op.ol, v = op.v;
+        const origin = or === null ? head : nodeAt(or, ol);
+        if (origin === undefined) { pushPending(op); return true; }   // origin unseen: hold, do not drop
+        // Read BOTH placeholders (born-dead, born-moved) BEFORE any ctx.changed()
+        // (scratch discipline): a delete and/or a move for this element may have
+        // landed before its birth. They write DISJOINT fields (monotone del vs LWW
+        // register), so both reconcile on the newborn and commute.
+        const dp = delPendingAt(nr, nl);
+        const mp = mvPendingAt(nr, nl);
+        // The anchor node and the element occupying it. Identity = birth (nl, nr);
+        // the birth node keeps a permanent `born` back-pointer so the element stays
+        // findable by identity after it moves. Register starts at birth (ml, mr).
+        // `or`/`ol` record the node's ORIGIN on the node itself: the RGA linked
+        // position is NOT a recoverable causal predecessor (concurrent inserts
+        // interleave), so serialization stores the origin and _mergeState re-runs
+        // integration from it rather than trusting any transmitted sibling order.
+        const node = { l: nl, r: nr, prev: null, next: null, e: null, born: null, or, ol };
+        const el = { bl: nl, br: nr, del: false, dl: 0, dr: "", v, ml: nl, mr: nr, node };
+        node.e = el; node.born = el;
+        let inner = byR.get(nr);
+        if (inner === undefined) { inner = new Map(); byR.set(nr, inner); }
+        inner.set(nl, node);
+        integrate(node, origin);          // links the anchor either way (survives as an insertion origin)
+        // Born-moved: a move for this element landed before its birth. Relink the
+        // newborn to the (already-minted) destination anchor under the winner stamp.
+        // The move's lamport strictly exceeds the birth's, so it always beats it.
+        if (mp !== undefined) {
+            const dest = nodeAt(mp.mr, mp.ml);
+            if (dest !== undefined && tsWins(mp.ml, mp.mr, el.ml, el.mr)) {
+                node.e = null;                  // vacate the birth anchor (still linked, an origin)
+                dest.e = el; el.node = dest;    // occupy the move destination
+                el.ml = mp.ml; el.mr = mp.mr;   // LWW register write
+            }
+            clearMvPending(nr, nl);
+        }
+        // Born-dead: monotone del wins over a late insert. Carry the remover stamp,
+        // do NOT count it live, do NOT project it. The anchor(s) stay linked.
+        if (dp !== undefined) {
+            el.del = true;
+            el.dl = dp.dl; el.dr = dp.dr;
+            clearDelPending(nr, nl);
+            drainPending(nr, nl);         // dependents named the birth anchor regardless of del
+            return true;                  // no visible change: no bump / no ctx.changed()
+        }
+        count++;
+        const pos = visIndexOf(el.node);  // el.node is the move destination if born-moved, else the birth node
+        proj.splice(pos, 0, v);
+        bump();
+        ctx.changed();            // may reentrantly applyOp -> clobber scratchOp; no scratch read follows
+        drainPending(nr, nl);     // drains from the captured anchor, never the (possibly clobbered) scratch
+        return true;
+    }
+
+    // Apply an ldel: mark the element (birth anchor (bl, br)) monotonically deleted,
+    // splice its value out of the projection, and keep the anchor linked. Idempotent:
+    // a re-delivered / duplicate ldel on an already-deleted element early-returns with
+    // NO allocation and NO splice (the steady-state remote path). A delete for an
+    // as-yet-unborn element records a placeholder (delete-before-insert).
+    function applyLdel(op) {
+        // Capture every scratch field into locals BEFORE any ctx.changed() (C5.1
+        // reentrancy discipline): a 'change' listener may reentrantly applyOp and
+        // clobber the doc-owned scratchOp, and nothing here may re-read it after.
+        const bl = op.bl, br = op.br, dl = op.l, dr = op.r;
+        // Resolve the element by its BIRTH identity (its birth node keeps a permanent
+        // `born` back-pointer, so a moved element is still found here). A node that
+        // exists at (br, bl) but is not a birth (born == null) -- only reachable via a
+        // crafted frame naming a move anchor's id -- fails closed as a placeholder.
+        const birthNode = nodeAt(br, bl);
+        const e = birthNode === undefined ? undefined : birthNode.born;
+        if (e == null) {
+            // Birth `lins` unseen: hold a placeholder so the element is born-dead
+            // when it finally integrates. Do not drop -- that would diverge under
+            // reorder (a late insert would resurrect a deleted element).
+            markDelPending(br, bl, dl, dr);
+            return true;
+        }
+        if (e.del) {
+            // Monotone: the flag stays true. Converge the remover stamp (higher (l, r)
+            // wins) so concurrent deletes of one element agree across replicas. Zero
+            // allocation, no splice -- the steady-state re-delivery path.
+            if (tsWins(dl, dr, e.dl, e.dr)) { e.dl = dl; e.dr = dr; }
+            return true;
+        }
+        const pos = visIndexOf(e.node);   // splice from the element's CURRENT display node (post-move)
+        e.del = true;
+        e.dl = dl; e.dr = dr;           // remember the remover stamp (C5.4 delta filtering needs it)
+        count--;
+        proj.splice(pos, 1);
+        bump();
+        ctx.changed();                  // may reentrantly applyOp -> clobber scratchOp; no scratch read follows
+        return true;
+    }
+
+    // Apply an lmv (move): UNCONDITIONALLY mint + integrate a fresh anchor at the
+    // destination origin, then CONDITIONALLY write the element's LWW position
+    // register (and relink it) under tsWins. Idempotent: a redelivered move whose
+    // anchor already integrated early-returns with NO allocation (the anchor id IS
+    // the move stamp, so its presence proves the move applied). Move || delete
+    // commute: a move never resurrects a deleted element (disjoint fields).
+    function applyLmv(op) {
+        // Capture EVERY scratch field into locals BEFORE any ctx.changed() (C5.1
+        // reentrancy discipline): a 'change' listener may reentrantly applyOp and
+        // clobber the doc-owned scratchOp, and nothing here may re-read it after.
+        const ml = op.l, mr = op.r;      // this move's stamp == the minted anchor's id
+        const bl = op.bl, br = op.br;    // the target element's birth identity
+        const or = op.or, ol = op.ol;    // destination origin (or === null => HEAD)
+        if (nodeAt(mr, ml) !== undefined) return true;   // anchor already minted -> idempotent no-op
+        // Step 1: resolve the destination origin; PEND if unseen (reuse the lins
+        // origin path, so a move delivered before its destination origin is held,
+        // never dropped -- dropping would diverge under reorder).
+        const origin = or === null ? head : nodeAt(or, ol);
+        if (origin === undefined) { pushPending(op); return true; }
+        // Mint + integrate the fresh anchor UNCONDITIONALLY -- a concurrent insert
+        // naming this move's anchor as its origin must still land, win or lose.
+        // The minted anchor records its ORIGIN (or, ol) for serialization, like lins.
+        const mNode = { l: ml, r: mr, prev: null, next: null, e: null, born: null, or, ol };
+        let inner = byR.get(mr);
+        if (inner === undefined) { inner = new Map(); byR.set(mr, inner); }
+        inner.set(ml, mNode);
+        integrate(mNode, origin);
+        // Step 2: find the target element by BIRTH identity.
+        const birthNode = nodeAt(br, bl);
+        const e = birthNode === undefined ? undefined : birthNode.born;
+        if (e == null) {
+            // Born-moved: the element's birth `lins` has not arrived. Retain the
+            // winning move stamp keyed by birth identity so the move is not lost; the
+            // destination anchor already stands (recoverable as nodeAt(mr, ml)). A
+            // crafted bl/br naming a non-birth node lands here too and fails closed.
+            markMvPending(br, bl, ml, mr);
+            drainPending(mr, ml);        // a concurrent insert may name the minted anchor
+            return true;
+        }
+        // Step 3: conditional register write under tsWins. A LOSING move keeps its
+        // minted anchor (ABANDONED -- it occupies no element) but does NOT move e;
+        // the element's register/position are untouched, so concurrent moves converge
+        // to the one tsWins winner on every replica.
+        if (tsWins(ml, mr, e.ml, e.mr)) {
+            const wasDel = e.del;
+            const fromNode = e.node;             // the element's current display node
+            const oldPos = wasDel ? -1 : visIndexOf(fromNode);
+            fromNode.e = null;                   // vacate the old anchor (now abandoned)
+            mNode.e = e; e.node = mNode;         // occupy the newly minted anchor
+            e.ml = ml; e.mr = mr;                // LWW register write
+            if (!wasDel) {
+                const newPos = visIndexOf(mNode);
+                proj.splice(oldPos, 1);
+                proj.splice(newPos, 0, e.v);
+                bump();
+                ctx.changed();                   // may reentrantly applyOp -> clobber scratchOp; no scratch read follows
+            }
+            // wasDel: move || delete commute -- the element stays invisible (no proj
+            // change, count unchanged); occupancy + register still track so every
+            // replica agrees on the (invisible) element's anchor.
+        }
+        drainPending(mr, ml);            // drains from the captured anchor, never the (possibly clobbered) scratch
+        return true;
+    }
+
+    function apply(op) {
+        if (op.t === "lins") return applyLins(op);
+        if (op.t === "ldel") return applyLdel(op);
+        if (op.t === "lmv") return applyLmv(op);
+        // Fail closed on an unknown list op type.
+        throw new CRDTError("malformed_op", "RGA list cannot apply op type '" + op.t + "'");
+    }
+
+    // LOCAL emit. `index` is a visible position in 0..size; validated closed.
+    function insert(index, value) {
+        const size = count;
+        if (typeof index !== "number" || !Number.isInteger(index) || index < 0 || index > size) {
+            throw new CRDTError("misconfigured",
+                "list('" + name + "').insert(index) requires an integer in 0.." + size + "; got " + index + ".");
+        }
+        const origin = index === 0 ? head : liveNodeAtVisible(index - 1);
+        // tick() BEFORE any record: a ceiling throw must not leave a half-applied op
+        // (C-17). C5.1 records no undo inverse for the list.
+        const l = ctx.tick();
+        const or = origin === head ? null : origin.r;
+        const ol = origin === head ? undefined : origin.l;
+        const op = { t: "lins", c: name, l, r: ctx.replicaId, or, ol, v: value };
+        applyLins(op);
+        ctx.emit(op);
+        return ctx.replicaId + "#" + l;   // birth-anchor id of the new element (op.r === ctx.replicaId)
+    }
+
+    // LOCAL emit: delete the live element at visible position `index` (0..size-1).
+    // An out-of-range or non-integer index is a positional programmer error and
+    // fails closed (misconfigured), symmetric with insert(). Returns true.
+    function deleteAt(index) {
+        const size = count;
+        if (typeof index !== "number" || !Number.isInteger(index) || index < 0 || index >= size) {
+            throw new CRDTError("misconfigured",
+                "list('" + name + "').delete(index) requires an integer in 0.." + (size - 1) + "; got " + index + ".");
+        }
+        const node = liveNodeAtVisible(index);   // guaranteed live (index < size)
+        const el = node.e;
+        const bl = el.bl, br = el.br;            // the element's BIRTH identity (NOT its move anchor's id)
+        // tick() BEFORE record/emit: a ceiling throw must not leave a half-applied op
+        // (C-17). C5.2 records no undo inverse for the list (as C5.1 does not).
+        const l = ctx.tick();
+        const op = { t: "ldel", c: name, l, r: ctx.replicaId, bl, br };
+        applyLdel(op);
+        ctx.emit(op);
+        return true;
+    }
+
+    // LOCAL emit: delete the element whose BIRTH anchor is (bl, br). Missing or
+    // already-deleted element is a no-op returning false -- consistent with
+    // OR-Set.deleteById on a missing value (add-wins never throws on a no-op remove).
+    // Emits nothing for a no-op (no tick, no op). Returns true iff a live element was
+    // deleted.
+    function deleteById(bl, br) {
+        const node = nodeAt(br, bl);
+        // Resolve via the birth node's identity home (`born`), which survives moves:
+        // a moved element's birth node has been vacated (node.e === null), so reading
+        // node.e here would wrongly treat a live moved element as deleted.
+        const e = node === undefined ? undefined : node.born;
+        if (e == null || e.del) return false;   // nonexistent / already deleted
+        const l = ctx.tick();
+        const op = { t: "ldel", c: name, l, r: ctx.replicaId, bl, br };
+        applyLdel(op);
+        ctx.emit(op);
+        return true;
+    }
+
+    // LOCAL emit: move the live element at visible position `fromIndex` to visible
+    // position `toIndex`. BOTH are visible positions in 0..size-1; an out-of-range
+    // or non-integer index is a positional programmer error and fails closed
+    // (misconfigured), symmetric with insert()/delete(). Because both are visible
+    // indices, this API can only address a LIVE element -- a deleted/absent element
+    // is unreachable here (the delete-convention no-op lives on the remote apply
+    // path, where a move of a deleted element is a harmless invisible register write).
+    //
+    // toIndex CONVENTION (the least-surprising array-move semantics, pinned by test):
+    // toIndex is the destination index in the array AFTER the element is removed --
+    // i.e. move(from, to) is `arr.splice(to, 0, arr.splice(from, 1)[0])`. So
+    // move(0, size-1) sends the head element to the tail, and a self-move
+    // move(i, i) is a no-op that still converges and leaves order intact.
+    function move(fromIndex, toIndex) {
+        const size = count;
+        if (typeof fromIndex !== "number" || !Number.isInteger(fromIndex) || fromIndex < 0 || fromIndex >= size) {
+            throw new CRDTError("misconfigured",
+                "list('" + name + "').move(from, to) requires an integer `from` in 0.." + (size - 1) + "; got " + fromIndex + ".");
+        }
+        if (typeof toIndex !== "number" || !Number.isInteger(toIndex) || toIndex < 0 || toIndex >= size) {
+            throw new CRDTError("misconfigured",
+                "list('" + name + "').move(from, to) requires an integer `to` in 0.." + (size - 1) + "; got " + toIndex + ".");
+        }
+        const fromNode = liveNodeAtVisible(fromIndex);   // guaranteed live (from < size)
+        const el = fromNode.e;
+        const bl = el.bl, br = el.br;                     // the element's stable birth identity
+        // Resolve the destination LEFT origin in the sequence WITHOUT the moved
+        // element (the post-removal convention): HEAD when toIndex === 0, else the
+        // node holding the (toIndex-1)-th live element with `fromNode` excluded.
+        const origin = toIndex === 0 ? head : liveNodeAtVisibleSkipping(toIndex - 1, fromNode);
+        // tick() BEFORE emit: a ceiling throw must not leave a half-applied op (C-17).
+        // C5.3 records no undo inverse for the list (as C5.1/C5.2 do not).
+        const l = ctx.tick();
+        const or = origin === head ? null : origin.r;
+        const ol = origin === head ? undefined : origin.l;
+        const op = { t: "lmv", c: name, l, r: ctx.replicaId, bl, br, or, ol };
+        applyLmv(op);
+        ctx.emit(op);
+        return true;
+    }
+
+    // Recompute count + the projection array from scratch off the live chain
+    // (used by mergeState, mirroring OR-Set.rebuildProjection). Chain order IS
+    // display order; a live element occupies its CURRENT display node, so counting
+    // where `e !== null && !e.del` visits each live element exactly once (a moved
+    // element at its destination, its vacated birth skipped). COLD path.
+    function rebuildList() {
+        const out = [];
+        let c = 0;
+        let x = head.next;
+        while (x !== null) {
+            const e = x.e;
+            if (e !== null && e !== undefined && !e.del) { out.push(e.v); c++; }
+            x = x.next;
+        }
+        count = c;
+        proj.splice(0, proj.length, ...out);
+        bump();
+        ctx.changed();
+    }
+
+    // COLD serialization (C5.4). State shape, keys SORTED for byte-identical
+    // converged output, over Object.create(null):
+    //   { kind:"list",
+    //     nodes: { "r#l": [or, ol] },                              // every anchor: its ORIGIN
+    //     elems: { "br#bl": [ml, mr, anchorKey, del, dl, dr, v] } } // every element by BIRTH id
+    // `or === null` marks a HEAD origin (ol then null). `anchorKey` is the element's
+    // CURRENT display anchor (birth until moved, else the winning move anchor). Keys
+    // split on lastIndexOf("#") -- a replicaId may itself contain "#".
+    function serializeNodeVal(node) {
+        return node.or === null ? [null, null] : [node.or, node.ol];
+    }
+    function serializeElemVal(el) {
+        return [el.ml, el.mr, el.node.r + "#" + el.node.l, el.del ? 1 : 0, el.dl, el.dr, el.v];
+    }
+    // Every anchor node in byR, sorted ascending by its "r#l" key string, so two
+    // replicas converged via different op orders emit byte-identical JSON (C-11,
+    // list kind). HEAD is the sentinel, never in byR, never serialized.
+    function sortedNodes() {
+        const arr = [];
+        for (const inner of byR.values()) for (const node of inner.values()) arr.push(node);
+        arr.sort((a, b) => { const ka = a.r + "#" + a.l, kb = b.r + "#" + b.l; return ka < kb ? -1 : ka > kb ? 1 : 0; });
+        return arr;
+    }
+    function getState() {
+        const nodes = Object.create(null);
+        const elems = Object.create(null);
+        const arr = sortedNodes();
+        for (let i = 0; i < arr.length; i++) {
+            const node = arr[i];
+            const key = node.r + "#" + node.l;
+            nodes[key] = serializeNodeVal(node);
+            const el = node.born;   // only a BIRTH node holds an element identity home
+            if (el !== null && el !== undefined) elems[key] = serializeElemVal(el);
+        }
+        return { kind: "list", nodes, elems };
+    }
+
+    // COLD delta: the getState() shape filtered to what a peer at version vector V
+    // has NOT seen. A node ships when `node.l > V[node.r]`. An element ships when
+    // ANY of its three stamps beats V[thatWriter]: birth (bl, br), move register
+    // (ml, mr), remover (dl, dr). Per-writer filtering IS sound here -- unlike the
+    // 0004 OR-Set `removed` hazard (a tombstone keyed only by the tag's ADD writer,
+    // so V could not certify the peer saw the REMOVE) -- because the reshaped record
+    // stores each mutation's OWN writer: `ldel` stamps the remover (dl, dr), `lmv`
+    // stamps the mover (ml, mr), `lins` stamps the inserter (bl, br). So V[dr] does
+    // certify the peer saw the delete, V[mr] the move, V[br] the birth. If a node an
+    // element depends on (its birth, or its move anchor) is unseen, that node's own
+    // `l > V[r]` ships it in the same delta; if seen, the peer already holds it.
+    // A peer at V merging getStateSince(V) reaches the identical state as merging the
+    // full getState(). V is the doc's validated prototype-free snapshot (safe single
+    // reads). Cold path.
+    function getStateSince(V) {
+        const nodes = Object.create(null);
+        const elems = Object.create(null);
+        const arr = sortedNodes();
+        for (let i = 0; i < arr.length; i++) {
+            const node = arr[i];
+            const key = node.r + "#" + node.l;
+            const svN = V[node.r]; const seenN = typeof svN === "number" ? svN : 0;
+            if (node.l > seenN) nodes[key] = serializeNodeVal(node);
+            const el = node.born;
+            if (el !== null && el !== undefined) {
+                const svb = V[el.br]; const seenb = typeof svb === "number" ? svb : 0;
+                const svm = V[el.mr]; const seenm = typeof svm === "number" ? svm : 0;
+                let ship = el.bl > seenb || el.ml > seenm;
+                if (!ship && el.del) { const svd = V[el.dr]; const seend = typeof svd === "number" ? svd : 0; ship = el.dl > seend; }
+                if (ship) elems[key] = serializeElemVal(el);
+            }
+        }
+        return { kind: "list", nodes, elems };
+    }
+
+    // COLD merge. Every incoming field goes through the SAME door discipline as the
+    // live ops (finite/ceiling lamports, non-empty string ids), read once into a
+    // local, dropped + reported (never applied, never thrown) on any malformation.
+    // Idempotent and commutative with live ops: an already-present node is skipped;
+    // an element merges by the SAME tsWins register / monotone-delete algebra as
+    // applyLmv / applyLdel; born-dead / born-moved placeholders are folded in exactly
+    // as applyLins does. Returns the MAX lamport absorbed so the doc advances its
+    // clock (C-12). O(state), COLD -- allocation permitted.
+    function mergeState(s) {
+        let maxL = 0;
+        const nsrc = s.nodes, esrc = s.elems;
+        // --- Nodes: re-integrate from origins in ASCENDING (l, r). A node's origin
+        // always has a strictly lower lamport (you must observe an origin before
+        // inserting after it), so ascending processing guarantees the origin is
+        // present by the time the node integrates; a node whose origin is STILL
+        // absent is an ORPHAN -> drop + report (fail closed, never hang). We NEVER
+        // trust a transmitted sibling order: every node re-integrates via the same
+        // `integrate` scan the live path uses, so an omitted/adversarial order
+        // cannot change convergence.
+        const ents = [];
+        if (nsrc !== null && typeof nsrc === "object") {
+            for (const key in nsrc) {
+                const idx = key.lastIndexOf("#");
+                if (idx < 1) { ctx.report(new CRDTError("malformed_state", "list('" + name + "') dropped a node with a malformed key '" + key + "'.")); continue; }
+                const r = key.slice(0, idx);
+                const l = Number(key.slice(idx + 1));
+                if (r.length === 0 || !Number.isFinite(l) || l < 0 || l >= MAX_LAMPORT) { ctx.report(new CRDTError("malformed_state", "list('" + name + "') dropped node '" + key + "' with a bad anchor id.")); continue; }
+                const a = nsrc[key];
+                if (!Array.isArray(a)) { ctx.report(new CRDTError("malformed_state", "list('" + name + "') dropped a malformed node '" + key + "'.")); continue; }
+                let or = a[0], ol = a[1];
+                if (or === null) { ol = undefined; }
+                else if (typeof or === "string" && or.length > 0 && typeof ol === "number" && Number.isFinite(ol) && ol >= 0 && ol < MAX_LAMPORT) { /* valid real origin */ }
+                else { ctx.report(new CRDTError("malformed_state", "list('" + name + "') dropped node '" + key + "' with a bad origin.")); continue; }
+                ents.push({ r, l, or, ol });
+            }
+        }
+        ents.sort((a, b) => cmpOK(a.l, a.r, b.l, b.r));
+        for (let i = 0; i < ents.length; i++) {
+            const e = ents[i];
+            ctx.observe(e.r, e.l); if (e.l > maxL) maxL = e.l;
+            if (nodeAt(e.r, e.l) !== undefined) continue;   // idempotent: already integrated
+            const origin = e.or === null ? head : nodeAt(e.or, e.ol);
+            if (origin === undefined) {
+                ctx.report(new CRDTError("malformed_state", "list('" + name + "') dropped orphan node '" + e.r + "#" + e.l + "' whose origin never arrived."));
+                continue;
+            }
+            const node = { l: e.l, r: e.r, prev: null, next: null, e: null, born: null, or: e.or, ol: e.ol };
+            let inner = byR.get(e.r);
+            if (inner === undefined) { inner = new Map(); byR.set(e.r, inner); }
+            inner.set(e.l, node);
+            integrate(node, origin);
+        }
+        // --- Elements: keyed by BIRTH identity, reconciled with the SAME algebra as
+        // the live ops (LWW register, monotone delete) plus the born-moved /
+        // born-dead placeholders, so a merge commutes with a replayed op log.
+        if (esrc !== null && typeof esrc === "object") {
+            for (const key in esrc) {
+                const idx = key.lastIndexOf("#");
+                if (idx < 1) { ctx.report(new CRDTError("malformed_state", "list('" + name + "') dropped an element with a malformed key '" + key + "'.")); continue; }
+                const br = key.slice(0, idx);
+                const bl = Number(key.slice(idx + 1));
+                if (br.length === 0 || !Number.isFinite(bl) || bl < 0 || bl >= MAX_LAMPORT) { ctx.report(new CRDTError("malformed_state", "list('" + name + "') dropped element '" + key + "' with a bad birth id.")); continue; }
+                const a = esrc[key];
+                if (!Array.isArray(a)) { ctx.report(new CRDTError("malformed_state", "list('" + name + "') dropped a malformed element '" + key + "'.")); continue; }
+                const ml = a[0], mr = a[1], anchorKey = a[2], delRaw = a[3], dlRaw = a[4], drRaw = a[5], v = a[6];
+                if (typeof ml !== "number" || !Number.isFinite(ml) || ml < 0 || ml >= MAX_LAMPORT || typeof mr !== "string" || mr.length === 0 || typeof anchorKey !== "string") { ctx.report(new CRDTError("malformed_state", "list('" + name + "') dropped element '" + key + "' with a bad register.")); continue; }
+                const isDel = delRaw === 1 || delRaw === true;
+                let dl = 0, dr = "";
+                if (isDel) {
+                    if (typeof dlRaw !== "number" || !Number.isFinite(dlRaw) || dlRaw < 0 || dlRaw >= MAX_LAMPORT || typeof drRaw !== "string" || drRaw.length === 0) { ctx.report(new CRDTError("malformed_state", "list('" + name + "') dropped element '" + key + "' with a bad remover stamp.")); continue; }
+                    dl = dlRaw; dr = drRaw;
+                }
+                const aidx = anchorKey.lastIndexOf("#");
+                if (aidx < 1) { ctx.report(new CRDTError("malformed_state", "list('" + name + "') dropped element '" + key + "' with a malformed anchor key.")); continue; }
+                const ar = anchorKey.slice(0, aidx);
+                const al = Number(anchorKey.slice(aidx + 1));
+                if (ar.length === 0 || !Number.isFinite(al) || al < 0 || al >= MAX_LAMPORT) { ctx.report(new CRDTError("malformed_state", "list('" + name + "') dropped element '" + key + "' with a bad anchor id.")); continue; }
+                const birthNode = nodeAt(br, bl);
+                if (birthNode === undefined) { ctx.report(new CRDTError("malformed_state", "list('" + name + "') dropped orphan element '" + key + "' with no birth anchor.")); continue; }
+                const anchorNode = nodeAt(ar, al);
+                if (anchorNode === undefined) { ctx.report(new CRDTError("malformed_state", "list('" + name + "') dropped element '" + key + "' whose display anchor is absent.")); continue; }
+                let el = birthNode.born;
+                if (el === null || el === undefined) {
+                    // FAIL CLOSED against crafted state: a legit getState() only ever
+                    // keys `elems` by a BIRTH node id, and a birth node's `e` slot is
+                    // free whenever its `born` is empty -- but a crafted state can key
+                    // an element by an OCCUPIED move-anchor id (born == null yet `e`
+                    // hosts a moved-in element). Adopting it as this element's home
+                    // would clobber `birthNode.e` and silently EVICT the real occupant
+                    // (data loss + injection via one frame). Reject + report; never
+                    // overwrite a live occupant.
+                    if (birthNode.e !== null && birthNode.e !== undefined) {
+                        ctx.report(new CRDTError("malformed_state", "list('" + name + "') dropped element '" + key + "' whose birth anchor is already occupied by another element (crafted state)."));
+                        continue;
+                    }
+                    // Fresh element: create at its birth node, then fold in local
+                    // born-moved / born-dead placeholders exactly as applyLins does
+                    // (disjoint fields -- monotone del vs LWW register -- so both
+                    // commute).
+                    el = { bl, br, del: false, dl: 0, dr: "", v, ml: bl, mr: br, node: birthNode };
+                    birthNode.born = el; birthNode.e = el;
+                    const mp = mvPendingAt(br, bl);
+                    if (mp !== undefined) {
+                        const dest = nodeAt(mp.mr, mp.ml);
+                        if (dest !== undefined && tsWins(mp.ml, mp.mr, el.ml, el.mr)) {
+                            // FAIL CLOSED against crafted state, symmetric with the two
+                            // other occupancy-write sites (birthNode.e at :1553 and the
+                            // LWW relink at :1589): the born-moved reconciliation writes
+                            // `dest.e = el`. A legit getState() mints a UNIQUE synthetic
+                            // move anchor per move, so `dest` is free -- but a crafted
+                            // state can name an anchor already occupied by another
+                            // (crafted) element and this write would EVICT it. Reject +
+                            // report; skip the relink so no occupant is clobbered. The
+                            // element stays at its birth node (Fix B, C5.5).
+                            if (dest.e !== null && dest.e !== undefined && dest.e !== el) {
+                                ctx.report(new CRDTError("malformed_state", "list('" + name + "') dropped the born-moved relink of element '" + key + "' onto an anchor already occupied by another element (crafted state)."));
+                            } else {
+                                birthNode.e = null; dest.e = el; el.node = dest; el.ml = mp.ml; el.mr = mp.mr;
+                            }
+                        }
+                        clearMvPending(br, bl);
+                    }
+                    const dp = delPendingAt(br, bl);
+                    if (dp !== undefined) {
+                        el.del = true; el.dl = dp.dl; el.dr = dp.dr;
+                        clearDelPending(br, bl);
+                    }
+                }
+                // LWW position register: relink to the incoming display anchor only
+                // when the incoming stamp beats the element's current register (so a
+                // losing/duplicate register is a no-op -- idempotent + commutative).
+                if (tsWins(ml, mr, el.ml, el.mr)) {
+                    if (el.node !== anchorNode) {
+                        // FAIL CLOSED against crafted state: a legit getState() gives
+                        // every element a UNIQUE display anchor (a fresh move-minted
+                        // node), so `anchorNode` is free (or already this element's).
+                        // A crafted element claiming another live element's display
+                        // anchor with a winning stamp would EVICT that occupant here.
+                        // Reject + report; keep the register write out entirely (no
+                        // relink, no eviction) so the real occupant is untouched.
+                        if (anchorNode.e !== null && anchorNode.e !== undefined) {
+                            ctx.report(new CRDTError("malformed_state", "list('" + name + "') dropped the relink of element '" + key + "' onto an anchor already occupied by another element (crafted state)."));
+                            continue;
+                        }
+                        if (el.node !== null && el.node !== undefined) el.node.e = null;
+                        anchorNode.e = el; el.node = anchorNode;
+                    }
+                    el.ml = ml; el.mr = mr;
+                }
+                // Monotone delete: once set never cleared; converge the remover stamp.
+                if (isDel) {
+                    if (!el.del) { el.del = true; el.dl = dl; el.dr = dr; }
+                    else if (tsWins(dl, dr, el.dl, el.dr)) { el.dl = dl; el.dr = dr; }
+                }
+                ctx.observe(br, bl); if (bl > maxL) maxL = bl;
+                ctx.observe(mr, ml); if (ml > maxL) maxL = ml;
+                if (isDel) { ctx.observe(dr, dl); if (dl > maxL) maxL = dl; }
+            }
+        }
+        rebuildList();
+        return maxL;
+    }
+
+    // COLD compaction, two tiers (decisions/0004 + the C5.4 quiescence condition).
+    //
+    // Tier 1 (ALWAYS, at minAck): an element whose delete AND move-register stamps
+    // are both causally stable (`del && dl <= minAck && ml <= minAck`) has its
+    // payload `v` + record dropped, KEEPING the bare anchor node(s) `{l,r,prev,next}`
+    // -- they may still be named as an insertion origin. Reclaims the unbounded
+    // element bytes, leaves the origin skeleton. The element is invisible (deleted),
+    // so count/projection are untouched.
+    //
+    // Tier 2 (anchor UNLINK, ONLY under global quiescence): the caller proved
+    // `minAck >= max(V.values()) && minAck >= doc.clock()`, i.e. no op naming any
+    // anchor can still be in flight -- the ONLY sound discharge of "no future op
+    // names this anchor". Only then may a TRULY unoccupied anchor -- `e === null`
+    // (hosts no live element) AND `born === null` (is no live element's birth home:
+    // an abandoned losing-move anchor, or a Tier-1-reclaimed birth node) AND not
+    // still named as an ORIGIN by any surviving node -- be unlinked from the chain
+    // and removed from byR. An occupied anchor, or a vacated birth home of a
+    // still-live moved element, is NEVER unlinked. The origin-leaf guard is a
+    // soundness necessity, not a nicety: a node stores its origin `(or, ol)` and
+    // `_mergeState` re-integrates from it, so removing a node another node still
+    // names as origin would DANGLE that dependent's origin and orphan it (a LIVE
+    // dependent would be dropped) on the next `getState -> mergeState` round-trip.
+    // A non-leaf tombstone is reclaimed on a LATER compact() once its dependents
+    // are themselves reclaimed (progressive, cascade-free per call). Without
+    // quiescence a lagging replica's concurrent op could still name the anchor, so
+    // unlinking would resurrect (RISK #4). Returns the count reclaimed.
+    function compact(minAck, quiesced) {
+        let reclaimed = 0;
+        // Tier 1: drop causally-stable deleted element records; keep bare anchors.
+        let x = head.next;
+        while (x !== null) {
+            const el = x.born;   // x is a birth node iff it holds an element identity home
+            if (el !== null && el !== undefined && el.del && el.dl <= minAck && el.ml <= minAck) {
+                if (el.node !== null && el.node !== undefined) el.node.e = null;   // vacate the display node
+                x.born = null;                                                     // drop the identity home + record
+                reclaimed++;
+            }
+            x = x.next;
+        }
+        // Tier 2: unlink truly-unoccupied, origin-leaf anchors, ONLY under proven
+        // quiescence. Collect the set of origins any SURVIVING node still names
+        // (after Tier 1) so a referenced anchor is never dangled.
+        if (quiesced) {
+            const referenced = new Set();
+            for (const inner of byR.values()) for (const node of inner.values()) {
+                if (node.or !== null && node.or !== undefined) referenced.add(node.or + "#" + node.ol);
+            }
+            let y = head.next;
+            while (y !== null) {
+                const ny = y.next;   // capture before any unlink
+                if (y.e === null && (y.born === null || y.born === undefined) && !referenced.has(y.r + "#" + y.l)) {
+                    y.prev.next = y.next;
+                    if (y.next !== null) y.next.prev = y.prev;
+                    const inner = byR.get(y.r);
+                    if (inner !== undefined) { inner.delete(y.l); if (inner.size === 0) byR.delete(y.r); }
+                    reclaimed++;
+                }
+                y = ny;
+            }
+        }
+        return reclaimed;
+    }
+
+    return {
+        kind: "list",
+        store: ro,
+        get size() { rev(); return count; },
+        insert,
+        delete: deleteAt,
+        deleteById,
+        move,
+        values() { rev(); const t = unwrap(proj); const out = new Array(t.length); for (let i = 0; i < t.length; i++) out[i] = roWrap(t[i]); return out; },
+        // Birth-anchor id ("r#l") per live element, in visible order -- a stable,
+        // replica-independent identity a UI can key on. Uses the ELEMENT's BIRTH
+        // identity (br#bl), NOT its current display anchor, so an id is stable across
+        // moves (a moved element occupies a fresh anchor but keeps its birth id).
+        // COLD read (walks the chain).
+        ids() {
+            rev();
+            const out = [];
+            let x = head.next;
+            while (x !== null) { if (x.e !== null && !x.e.del) out.push(x.e.br + "#" + x.e.bl); x = x.next; }
+            return out;
+        },
+        snapshot() { return storeSnapshot(unwrap(proj)); },
+        _apply: apply,
+        _getState: getState,
+        _getStateSince: getStateSince,
+        _mergeState: mergeState,
+        _compact: compact,
+        // Test-only retention/structure probes. `anchors` = every node in byR
+        // (Tier-2 compaction reduces it); `elems` = LIVE element count (== size);
+        // `pending` = held origin/placeholder ops. The deleted-record census that
+        // Tier-1 compaction reclaims is observable off getState().elems (the
+        // serialized element count), so the probe shape stays stable across the arc.
+        _retention() {
+            let anchors = 0;
+            for (const inner of byR.values()) anchors += inner.size;
+            // Anchor-justification census (test-only, cold; the Set alloc never
+            // touches a hot path). After a QUIESCENT compact every display-
+            // unoccupied (e === null) anchor must be JUSTIFIED -- either a still-
+            // live moved element's birth home (born !== null) or still named as an
+            // origin by a surviving node (the origin-leaf guard) -- otherwise Tier-2
+            // should have unlinked it. `reclaimable` = the UNJUSTIFIED unoccupied
+            // anchors (born === null AND unreferenced): it MUST be 0 after a
+            // quiescent compact and grows O(ops) without one, so anchors settles to
+            // exactly `elems + justified` (<= size + 1 + U, the C5.5 T7 bound). See
+            // decisions/0004 + 0006.
+            const referenced = new Set();
+            for (const inner of byR.values()) for (const node of inner.values()) {
+                if (node.or !== null && node.or !== undefined) referenced.add(node.or + "#" + node.ol);
+            }
+            let unoccupied = 0, reclaimable = 0, justified = 0;
+            for (const inner of byR.values()) for (const node of inner.values()) {
+                if (node.e === null) {
+                    unoccupied++;
+                    if ((node.born !== null && node.born !== undefined) || referenced.has(node.r + "#" + node.l)) justified++;
+                    else reclaimable++;
+                }
+            }
+            return { anchors, elems: count, pending: pendingCount, unoccupied, reclaimable, justified };
+        },
+        // Structural invariant, off the live chain (getState is an empty stub in
+        // C5.1). Throws on any break; used by the torture harness validate().
+        _validate(clock) {
+            const seen = new Set();
+            let prev = head;
+            let x = head.next;
+            let live = 0;
+            while (x !== null) {
+                if (typeof x.l !== "number" || !Number.isFinite(x.l)) throw new Error("validate: list '" + name + "' node l not finite: " + x.l);
+                if (x.l > clock) throw new Error("validate: list '" + name + "' node l " + x.l + " > clock " + clock);
+                if (typeof x.r !== "string") throw new Error("validate: list '" + name + "' node r not a string");
+                if (x.prev !== prev) throw new Error("validate: list '" + name + "' broken prev link at (" + x.r + "," + x.l + ")");
+                if (seen.has(x)) throw new Error("validate: list '" + name + "' chain cycle at (" + x.r + "," + x.l + ")");
+                if (nodeAt(x.r, x.l) !== x) throw new Error("validate: list '" + name + "' node (" + x.r + "," + x.l + ") not indexed in byR");
+                seen.add(x);
+                if (x.e !== null) {
+                    // An occupied anchor's element must point back at it, and the
+                    // element's BIRTH node must still hold the identity home (born) --
+                    // both survive moves (occupancy migrates, identity does not).
+                    if (x.e.node !== x) throw new Error("validate: list '" + name + "' node (" + x.r + "," + x.l + ") occupant back-pointer mismatch");
+                    const bn = nodeAt(x.e.br, x.e.bl);
+                    if (bn === undefined || bn.born !== x.e) throw new Error("validate: list '" + name + "' element birth home lost for (" + x.e.br + "," + x.e.bl + ")");
+                    if (!x.e.del) live++;
+                }
+                prev = x;
+                x = x.next;
+            }
+            let total = 0;
+            for (const inner of byR.values()) total += inner.size;
+            if (total !== seen.size) throw new Error("validate: list '" + name + "' byR has " + total + " nodes but chain visits " + seen.size + " (orphan/unlinked)");
+            const plen = unwrap(proj).length;
+            if (plen !== count) throw new Error("validate: list '" + name + "' proj.length " + plen + " !== count " + count);
+            if (live !== count) throw new Error("validate: list '" + name + "' live " + live + " !== count " + count);
+            return true;
+        },
+        _dispose() {
+            disposeStore(proj); disposeSignal(rev);
+            byR.clear(); pending.clear(); delPending.clear(); mvPending.clear(); pendingCount = 0; count = 0;
+            head.next = null; head.prev = null;
+        },
+    };
+}
+
 /* --- PN-Counter ------------------------------------------------------------ */
 
 /**
@@ -985,6 +1958,34 @@ function okOp(op) {
     if (typeof l !== "number" || !Number.isFinite(l) || l >= MAX_LAMPORT) return false;
     if (typeof op.r !== "string" || op.r.length === 0) return false;
     if (t === "set" || t === "del") return typeof op.k === "string";
+    if (t === "lins") {
+        // l (finite < 2^53) and r (non-empty string) are already checked above.
+        // Origin is HEAD (or === null) OR a real anchor: non-empty string `or`
+        // with a finite `ol < 2^53`. Fail closed on anything else.
+        const or = op.or;
+        if (or === null) return true;
+        return typeof or === "string" && or.length > 0 &&
+            typeof op.ol === "number" && Number.isFinite(op.ol) && op.ol < MAX_LAMPORT;
+    }
+    if (t === "ldel") {
+        // l (finite < 2^53) and r (non-empty string) are already checked above.
+        // The target birth anchor: bl finite < 2^53, br a non-empty string. Fail
+        // closed on anything else (a bad ldel never applies, never crashes).
+        return typeof op.bl === "number" && Number.isFinite(op.bl) && op.bl < MAX_LAMPORT &&
+            typeof op.br === "string" && op.br.length > 0;
+    }
+    if (t === "lmv") {
+        // l (this move's stamp) and r checked above. The target birth anchor: bl
+        // finite < 2^53, br a non-empty string. The destination origin: HEAD
+        // (or === null) OR a non-empty string `or` with a finite `ol < 2^53`. Fail
+        // closed on anything else (a bad lmv never applies, never crashes).
+        if (!(typeof op.bl === "number" && Number.isFinite(op.bl) && op.bl < MAX_LAMPORT &&
+            typeof op.br === "string" && op.br.length > 0)) return false;
+        const or = op.or;
+        if (or === null) return true;
+        return typeof or === "string" && or.length > 0 &&
+            typeof op.ol === "number" && Number.isFinite(op.ol) && op.ol < MAX_LAMPORT;
+    }
     if (t === "add") return typeof op.id === "string" && typeof op.n === "number";
     if (t === "upd") return typeof op.id === "string";
     if (t === "rm") {
@@ -1014,6 +2015,9 @@ function okState(cs, kind) {
     }
     if (kind === "counter") {
         return cs.p !== null && typeof cs.p === "object" && cs.n !== null && typeof cs.n === "object";
+    }
+    if (kind === "list") {
+        return cs.nodes !== null && typeof cs.nodes === "object" && cs.elems !== null && typeof cs.elems === "object";
     }
     // set
     return cs.adds !== null && typeof cs.adds === "object" &&
@@ -1111,7 +2115,7 @@ export function createCRDTDoc(options) {
     // fields BEFORE it fires ctx.changed(), so a nested applyOp cannot clobber a
     // field an outer apply() has yet to read. The local mutation API builds its
     // own plain ops and never touches this scratch.
-    const scratchOp = { t: "", c: "", k: undefined, id: undefined, l: 0, r: "", v: undefined, n: undefined, p: undefined, g: undefined };
+    const scratchOp = { t: "", c: "", k: undefined, id: undefined, l: 0, r: "", v: undefined, n: undefined, p: undefined, g: undefined, ol: undefined, or: undefined, bl: undefined, br: undefined };
     // Listener lists are plain arrays iterated by index, so dispatch allocates
     // no iterator. (Adding/removing a listener from inside its own dispatch is
     // not guaranteed to take effect within that same dispatch.)
@@ -1216,6 +2220,7 @@ export function createCRDTDoc(options) {
     function kindFromOpType(t) {
         if (t === "set" || t === "del") return "map";
         if (t === "add" || t === "upd" || t === "rm") return "set";
+        if (t === "lins" || t === "ldel" || t === "lmv") return "list";
         if (t === "cinc" || t === "cdec") return "counter";
         throw new CRDTError("malformed_op", "unknown op type '" + t + "'");
     }
@@ -1225,6 +2230,7 @@ export function createCRDTDoc(options) {
         if (col === undefined) {
             col = kind === "map" ? createLWWMap(name, ctx)
                 : kind === "counter" ? createPNCounter(name, ctx)
+                : kind === "list" ? createRGAList(name, ctx)
                 : createORSet(name, setOpts || {}, ctx);
             cols.set(name, col);
             return col;
@@ -1253,6 +2259,10 @@ export function createCRDTDoc(options) {
         counter(name) {
             if (disposed) throw new CRDTError("misconfigured", "doc is disposed; cannot create or access collections");
             return getCollection(name, "counter");
+        },
+        list(name) {
+            if (disposed) throw new CRDTError("misconfigured", "doc is disposed; cannot create or access collections");
+            return getCollection(name, "list");
         },
 
         transact(fn) {
@@ -1307,6 +2317,7 @@ export function createCRDTDoc(options) {
             const s = scratchOp;
             s.t = op.t; s.c = op.c; s.k = op.k; s.id = op.id;
             s.l = op.l; s.r = op.r; s.v = op.v; s.n = op.n; s.p = op.p; s.g = op.g;
+            s.ol = op.ol; s.or = op.or; s.bl = op.bl; s.br = op.br;
             if (typeof s.t !== "string" || typeof s.c !== "string") {
                 throw new CRDTError("malformed_op", "applyOp expects an op object with string `t` and `c`.");
             }
@@ -1367,10 +2378,19 @@ export function createCRDTDoc(options) {
                 lamport = state.clock;
             }
             for (const name in state.cols) {
+                // Re-check disposal between collections: a 'change' listener fired
+                // by an EARLIER collection's _mergeState (rebuildList/rebuildProjection
+                // fires ctx.changed() as its last act) may have reentrantly called
+                // doc.dispose(), which clears `cols`. Without this guard the loop would
+                // march on to the next name and getCollection() would recreate a live
+                // store/signal-holding collection into the just-cleared Map -- a zombie
+                // never passed to _dispose(), a retention leak past disposal. Bail fail
+                // closed the instant the doc is disposed (Fix A, C5.5).
+                if (disposed) return;
                 const cs = state.cols[name];
                 // Fail closed on a malformed collection: skip and report, never a
                 // raw TypeError and never a silent partial apply (C-06).
-                if (cs === null || typeof cs !== "object" || (cs.kind !== "map" && cs.kind !== "counter" && cs.kind !== "set")) {
+                if (cs === null || typeof cs !== "object" || (cs.kind !== "map" && cs.kind !== "counter" && cs.kind !== "set" && cs.kind !== "list")) {
                     report(new CRDTError("malformed_state", "dropped a malformed collection '" + name + "'."));
                     continue;
                 }
@@ -1425,8 +2445,20 @@ export function createCRDTDoc(options) {
                 return 0;
             }
             const minAck = minAckOf(vsnap);
+            // The list Tier-2 global-quiescence predicate, computed ONCE and passed
+            // to every collection's _compact (core-three ignores the extra arg):
+            // minAck >= max(V.values()) (every replica at the SAME frontier) AND
+            // minAck >= this doc's clock (no local op past the frontier) => no op
+            // naming any anchor can still be in flight -- the ONLY sound discharge
+            // of "no future op names anchor A" from a version vector (decisions/0004
+            // + C5.4 RISK #4). A single lagging replica (minAck < max) or a local op
+            // ahead of the frontier (minAck < clock) leaves quiesced false, so Tier-2
+            // does not unlink and cannot resurrect.
+            let maxAck = 0;
+            for (const r in vsnap) { const n = vsnap[r]; if (n > maxAck) maxAck = n; }
+            const quiesced = minAck >= maxAck && minAck >= lamport;
             let reclaimed = 0;
-            for (const [, col] of cols) reclaimed += col._compact(minAck);
+            for (const [, col] of cols) reclaimed += col._compact(minAck, quiesced);
             return reclaimed;
         },
 
@@ -1477,6 +2509,13 @@ export function createCRDTDoc(options) {
         // (connectBroadcastChannel) to fail closed on a crafted frame without
         // letting it throw out of the message handler.
         _report(e) { report(e); },
+
+        // Internal test/harness probe: iterate the live collections (so the torture
+        // validate() can reach a list collection's structural invariant, _validate --
+        // its linked chain is not exposed by getState in C5.1). Yields VALUES from a
+        // fresh iterator, never the live `cols` Map by reference, so a probe caller
+        // cannot add/drop/rename a collection out from under the doc.
+        _cols() { return cols.values(); },
 
         dispose() {
             if (disposed) return;

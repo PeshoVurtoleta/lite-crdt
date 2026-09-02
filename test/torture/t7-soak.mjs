@@ -149,4 +149,83 @@ export function run() {
     comp.dispose(); ctrl.dispose();
     compactTracker.untrack(compH); compactTracker.untrack(ctrlH);
     check(compactTracker.size() === 0, () => `T7/C4: leak tracker retained ${compactTracker.size()} docs after the compaction soak`);
+
+    // -- C5.5 RGA list retention/compaction soak (ASSERTION 4) ---------------
+    // ~20000-op churn over ~64 live elements on two lock-stepped docs: `lcomp`
+    // compacts periodically and once finally under proven quiescence; `lctrl` is
+    // fed the identical op stream and NEVER compacts. After the quiescent compact
+    // Tier-2 must have unlinked every unjustified unoccupied anchor (reclaimable
+    // == 0) so lcomp's anchor census settles to the size+1+U bound; the control's
+    // grows O(ops). The visible sequence is byte-identical, and replaying the
+    // whole log after compaction resurrects nothing (decisions/0004 + 0006).
+    const LCHURN = 20000;
+    const LIVE = 64;
+    const lprng = makePrng(SEED ^ 0x115700);
+    const lpick = (n) => Math.floor(frac(lprng) * n);
+    const lcomp = createCRDTDoc({ replicaId: "LCOMP" });
+    const lctrl = createCRDTDoc({ replicaId: "LCOMP" });   // same id -> identical stream when fed lcomp's ops
+    const lcompList = lcomp.list("bag");
+    const lctrlList = lctrl.list("bag");
+    const lLog = [];
+    lcomp.on("op", (op) => lLog.push(op));
+    for (let i = 0; i < LCHURN; i++) {
+        const size = lcompList.size;
+        // Keep the live set near LIVE: grow when small, churn (delete/move) when full.
+        let kind;
+        if (size === 0) kind = 0;
+        else if (size < LIVE) kind = (lpick(4) === 0 && size > 1) ? 2 : 0;   // mostly insert, occasional move
+        else kind = lpick(2) === 0 ? 1 : (size > 1 ? 2 : 1);                 // delete or move
+        if (kind === 0) lcompList.insert(lpick(size + 1), i);
+        else if (kind === 1) lcompList.delete(lpick(size));
+        else lcompList.move(lpick(size), lpick(size));
+        if ((i & 4095) === 4095) lcomp.compact(lcomp.versionVector());       // periodic reclamation
+    }
+    for (const op of lLog) lctrl.applyOp(op);                               // feed control the identical stream
+    // Final reclamation: compact to a FIXPOINT. Tier-2 unlink is progressive and
+    // cascade-free per call -- a chain of dead tombstone anchors drains one leaf
+    // layer per pass (removing a leaf exposes its predecessor next pass), because
+    // a single pass must never dangle a still-referenced origin (the origin-leaf
+    // guard). Iterating to reclaimed == 0 drives every UNREFERENCED dead anchor
+    // out; what remains is only JUSTIFIED (decisions/0006).
+    let lpasses = 0, lrec;
+    do { lrec = lcomp.compact(lcomp.versionVector()); lpasses++; } while (lrec > 0 && lpasses < 400);
+
+    const cr = lcompList._retention();
+    const kr = lctrlList._retention();
+    const lsize = lcompList.size;
+    // At the fixpoint every unjustified unoccupied anchor is reclaimed.
+    check(cr.reclaimable === 0, () => `T7/list: compacted list left ${cr.reclaimable} unjustified unoccupied anchors at the compaction fixpoint (${lpasses} passes) -- Tier-2 did not fully reclaim`);
+    // The confirmed bound: anchors <= size + 1 + U (U = justified unoccupied =
+    // still-live moved-element birth homes + origin-referenced anchors). With
+    // reclaimable == 0 the census is exactly `size + justified`.
+    check(cr.anchors <= lsize + 1 + cr.justified, () => `T7/list: compacted anchors ${cr.anchors} exceed the size+1+U bound (${lsize}+1+${cr.justified})`);
+    // U is O(live), never O(ops): far below the churn count.
+    check(cr.justified <= 12 * LIVE, () => `T7/list: justified unoccupied anchors ${cr.justified} not O(live) (bound ${12 * LIVE}, churn ${LCHURN})`);
+    check(cr.anchors < 2000, () => `T7/list: compacted anchor census ${cr.anchors} is not O(live) (churn ${LCHURN})`);
+    check(cr.elems === lsize, () => `T7/list: elems ${cr.elems} !== size ${lsize}`);
+    // The uncompacted control retains O(ops) anchors and dead tombstones.
+    check(kr.reclaimable > 2000, () => `T7/list: uncompacted control kept only ${kr.reclaimable} reclaimable anchors (expected O(ops) over ${LCHURN} churn)`);
+    check(kr.anchors > cr.anchors, () => `T7/list: control anchors ${kr.anchors} not larger than compacted ${cr.anchors}`);
+    check(kr.anchors > 5000, () => `T7/list: control anchors ${kr.anchors} should be O(ops)`);
+    // Observable convergence untouched by compaction.
+    check(canon(lcomp) === canon(lctrl), () => "T7/list: compaction changed the observable snapshot vs the uncompacted control");
+    validate(lcomp); validate(lctrl);
+    // Over-reclamation guard (origin-leaf): serialize the compacted doc and merge
+    // it into a FRESH peer. If Tier-2 unlinked an anchor a surviving node still
+    // names as origin, that node ships with a dangling origin and the peer
+    // orphan-drops the live element -- a peer render that differs from the source
+    // is silent data loss. This catches over-reclamation the same-doc replay
+    // cannot (defense in depth with T9 rga-4).
+    const lpeer = createCRDTDoc({ replicaId: "LPEER" });
+    lpeer.mergeState(lcomp.getState());
+    check(canon(lpeer) === canon(lcomp), () => "T7/list: compacted state lost a live element on a fresh-peer getState -> mergeState round-trip (Tier-2 over-reclaimed a still-referenced origin anchor)");
+    validate(lpeer);
+    lpeer.dispose();
+    // No compacted anchor resurrects: replaying the whole log after compaction
+    // leaves the render unchanged.
+    const lCanonBefore = canon(lcomp);
+    for (const op of lLog) lcomp.applyOp(op);
+    check(canon(lcomp) === lCanonBefore, () => "T7/list: replaying the full log after compaction resurrected a reclaimed anchor");
+    validate(lcomp);
+    lcomp.dispose(); lctrl.dispose();
 }

@@ -19,6 +19,7 @@ import { run as t0 } from "./torture/t0-laws.mjs";
 import { run as t1 } from "./torture/t1-degenerate.mjs";
 import { run as t4 } from "./torture/t4-door.mjs";
 import { run as t5 } from "./torture/t5-fuzz.mjs";
+import { run as t5list } from "./torture/t5-list-oracle.mjs";
 import { run as t6 } from "./torture/t6-alloc.mjs";
 import { run as t7 } from "./torture/t7-soak.mjs";
 import { run as t9 } from "./torture/t9-controls.mjs";
@@ -28,6 +29,7 @@ const TIERS = [
     ["T1 degenerate", t1],
     ["T4 door", t4],
     ["T5 convergence-fuzz", t5],
+    ["T5 list-oracle", t5list],
     ["T6 alloc", t6],
     ["T7 soak", t7],
     ["T9 controls", t9],

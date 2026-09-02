@@ -8,6 +8,7 @@ export const VERSION: string;
 export type CRDTErrorCode =
     | "kind_mismatch"
     | "malformed_op"
+    | "malformed_state"
     | "readonly"
     | "misconfigured";
 
@@ -18,7 +19,7 @@ export class CRDTError extends Error {
     constructor(code: CRDTErrorCode, message: string, opts?: { cause?: unknown });
 }
 
-/* ── Operations (the transport-facing wire format) ── */
+/* -- Operations (the transport-facing wire format) -- */
 
 /** LWW-Map: set a key. */
 export interface SetOp<V = unknown> { t: "set"; c: string; k: string; v: V; l: number; r: string; }
@@ -36,10 +37,26 @@ export interface CIncOp { t: "cinc"; c: string; r: string; p: number; }
 /** PN-Counter: carries the replica's NEW cumulative decrement total. Merged by max (no Lamport). */
 export interface CDecOp { t: "cdec"; c: string; r: string; n: number; }
 
-/** Any operation. Ops are plain JSON-serializable objects, commutative and idempotent. */
-export type Op = SetOp | DelOp | AddOp | UpdOp | RmOp | CIncOp | CDecOp;
+/**
+ * RGA list: insert a value. `(l, r)` is the new element's immutable BIRTH anchor
+ * id; `(or, ol)` is its destination ORIGIN anchor (`or === null` = HEAD, `ol`
+ * then absent). Concurrent same-origin inserts order by `(lamport, replicaId)`
+ * descending.
+ */
+export interface LinsOp<V = unknown> { t: "lins"; c: string; l: number; r: string; or: string | null; ol?: number; v: V; }
+/** RGA list: delete the element whose BIRTH anchor is `(bl, br)` (monotone; `(l, r)` is the remover stamp). */
+export interface LdelOp { t: "ldel"; c: string; l: number; r: string; bl: number; br: string; }
+/**
+ * RGA list: move the element whose BIRTH anchor is `(bl, br)`. `(l, r)` is BOTH
+ * this move's LWW register stamp and the id of the fresh anchor it mints at the
+ * destination origin `(or, ol)` (`or === null` = HEAD).
+ */
+export interface LmvOp { t: "lmv"; c: string; l: number; r: string; bl: number; br: string; or: string | null; ol?: number; }
 
-/* ── Collections ── */
+/** Any operation. Ops are plain JSON-serializable objects, commutative and idempotent. */
+export type Op = SetOp | DelOp | AddOp | UpdOp | RmOp | CIncOp | CDecOp | LinsOp | LdelOp | LmvOp;
+
+/* -- Collections -- */
 
 /**
  * Last-Write-Wins map. Conflicts resolve by a (lamport, replicaId) total order;
@@ -146,7 +163,62 @@ export interface PNCounter {
     snapshot(): number;
 }
 
-/* ── Document ── */
+/**
+ * RGA (Replicated Growable Array) positional sequence. Element identity is an
+ * immutable birth anchor `(l, r)`; position is fixed at integration by the RGA
+ * scan (concurrent same-origin inserts descend by `(lamport, replicaId)`), so
+ * order is deterministic and replica-independent. Delete is a monotone flag; MOVE
+ * is a first-class LWW position register whose value is a freshly minted anchor id
+ * (so move||delete commute and concurrent moves converge to one winner). Out-of-
+ * order frames PEND (capped, fail-closed), never drop. See decisions/0006.
+ *
+ * `store` is a read-only reactive array projection; mutating it throws.
+ */
+export interface RGAList<V = unknown> {
+    /** Read-only reactive array projection (a lite-store). Mutating it throws CRDTError("readonly"). */
+    readonly store: ReadonlyArray<V>;
+    /** Live element count (excludes tombstones). Reactive read. */
+    readonly size: number;
+    /** Values in visible sequence order. Nested objects come back read-only. */
+    values(): V[];
+    /**
+     * Per-element BIRTH-anchor id `"r#l"` in visible order -- a stable, replica-
+     * independent identity a UI can key on (stable across moves: a moved element
+     * keeps its birth id).
+     */
+    ids(): string[];
+    /**
+     * Insert `value` at visible position `index` (0..size). Emits a `lins` op.
+     * Returns the new element's birth-anchor id `"r#l"`.
+     * @throws {CRDTError} `misconfigured` if `index` is not an integer in 0..size.
+     */
+    insert(index: number, value: V): string;
+    /**
+     * Delete the live element at visible position `index` (0..size-1). Emits a
+     * `ldel` op. Returns `true`.
+     * @throws {CRDTError} `misconfigured` if `index` is not an integer in 0..size-1.
+     */
+    delete(index: number): boolean;
+    /**
+     * Delete the element whose birth anchor is `(bl, br)`. A missing or already-
+     * deleted element is a no-op returning `false` (emits nothing); a live delete
+     * emits one `ldel` and returns `true`.
+     */
+    deleteById(bl: number, br: string): boolean;
+    /**
+     * Move the live element at visible position `fromIndex` to visible position
+     * `toIndex` (both 0..size-1). Emits one `lmv`. `toIndex` is the destination
+     * index AFTER the element is removed: `move(from, to)` is
+     * `arr.splice(to, 0, arr.splice(from, 1)[0])`. A self-move `move(i, i)` is a
+     * converging no-op. Returns `true`.
+     * @throws {CRDTError} `misconfigured` if either index is not an integer in range.
+     */
+    move(fromIndex: number, toIndex: number): boolean;
+    /** Plain deep-cloned snapshot of the visible sequence in order. */
+    snapshot(): V[];
+}
+
+/* -- Document -- */
 
 /** Opaque, JSON-serializable full-state payload produced by {@link CRDTDoc.getState}. */
 export interface DocState {
@@ -183,6 +255,8 @@ export interface CRDTDoc {
     array<V = unknown>(name: string, options?: ArrayOptions<V>): ORSet<V>;
     /** Get or create a named PN-Counter. Throws if the name already exists as another kind. */
     counter(name: string): PNCounter;
+    /** Get or create a named RGA list. Throws if the name already exists as another kind. */
+    list<V = unknown>(name: string): RGAList<V>;
     /**
      * Run `fn`, buffering every op it emits and flushing them as ONE op-array
      * payload: a single `ops` event (one network frame, one `applyOps` on the

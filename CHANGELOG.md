@@ -4,6 +4,238 @@ All notable changes to `@zakkster/lite-crdt` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [2.0.0] - 2026-09-03 -- RGA positional-sequence list (`doc.list`)
+
+A new fourth CRDT collection: `doc.list(name)`, an **RGA** (Replicated Growable
+Array) positional sequence with first-class insert, delete and MOVE, alongside the
+existing LWW-Map, OR-Set and PN-Counter. Op-based (`lins`/`ldel`/`lmv`), order-
+independent and duplicate-tolerant like the core three, projected into a read-only
+reactive `lite-store`. The apply/emit core-three bytes are untouched; this whole
+release is ADDITIVE on the new `list` kind (`decisions/0006-rga-sequence.md`).
+
+The model in one line: element identity is an immutable **birth anchor** `(l, r)`;
+position is fixed forever by the RGA integration scan (concurrent same-origin
+inserts descend by `(lamport, replicaId)`); delete is a **monotone flag**; and MOVE
+is a **first-class LWW position register whose value is a freshly minted anchor id**
+(not delete+reinsert, not an element-relative pointer) -- so move||delete commute
+(disjoint fields) and concurrent moves of one element converge to a single winner.
+Out-of-order frames PEND (capped, fail-closed), never drop.
+
+### The one 2.0 breaking change (forward-only)
+
+A 1.x replica throws `malformed_op` on any `lins`/`ldel`/`lmv` frame and drops a
+`kind:"list"` state; a 2.0 replica is a strict SUPERSET. The core-three wire format
+is UNCHANGED and proven byte-identical to 1.3.1 (`getState()` over a frozen corpus,
+gated in `test/27-golden-core-three.test.mjs`): `set/del/add/upd/rm/cinc/cdec`
+payloads, `tsWins`/`cmpOK`, `okOp`'s existing branches, and the map/set/counter
+`getState`/`mergeState`/`compact` algebra are identical. Nothing else shifts.
+
+### Added -- serialization, delta, compaction (C5.4)
+
+- **`list` serialization** -- `_getState()` emits
+  `{ kind:"list", nodes:{ "r#l":[or,ol] }, elems:{ "br#bl":[ml,mr,anchorKey,del,dl,dr,v] } }`
+  over `Object.create(null)` with keys SORTED, so two replicas converged via
+  different op orders serialize byte-identically (C-11, list kind). `nodes` carries
+  every anchor's origin (`or === null` marks HEAD); `elems` carries every element by
+  its BIRTH identity, with `anchorKey` its current display anchor (birth until moved,
+  else the winning move anchor). Keys split on `lastIndexOf("#")` (a replicaId may
+  itself contain "#").
+- **`list` merge** -- `_mergeState(state)` re-runs RGA integration from origins in
+  ASCENDING `(l, r)` order (a node's origin has a strictly lower lamport, so it is
+  always present by the time the node integrates); it NEVER trusts a transmitted
+  sibling order (re-integrates via the same `integrate` scan as the live path), so a
+  malicious/omitted order cannot change convergence. A node whose origin never
+  arrives is an ORPHAN -> dropped + reported to `onError` (fail closed, never hangs).
+  Every incoming field passes the SAME door discipline as the live ops
+  (finite/ceiling lamports, non-empty string ids); a malformed piece is dropped +
+  reported, never applied. Elements merge by the SAME `tsWins` register /
+  monotone-delete algebra as `applyLmv`/`applyLdel`, folding in local born-moved /
+  born-dead placeholders exactly as `applyLins` does -- so merging a state then
+  replaying the op log (or vice versa) converges to the identical structure.
+- **`list` delta** -- `_getStateSince(V)` ships a node when `node.l > V[node.r]` and
+  an element when ANY of its three stamps -- birth `(bl,br)`, move register
+  `(ml,mr)`, remover `(dl,dr)` -- beats `V[thatWriter]`. Per-writer filtering IS
+  sound for the list (the 0004 OR-Set `removed` hazard does NOT recur) because the
+  reshaped record stores each mutation's OWN writer: `ldel` stamps the remover,
+  `lmv` the mover, `lins` the inserter. A peer at `V` merging `getStateSince(V)`
+  reaches the identical state as merging the full `getState()`. A malformed `V`
+  fails closed to a full `getState()`.
+- **`list` compaction** -- `_compact(minAck, quiesced)` has two tiers.
+  **Tier 1** (always): a deleted element whose delete AND move-register stamps are
+  both causally stable (`del && dl <= minAck && ml <= minAck`) has its payload `v`
+  and record dropped, KEEPING the bare anchor node (still nameable as an insertion
+  origin). **Tier 2** (only under caller-proven global quiescence
+  `minAck >= max(V.values()) && minAck >= doc.clock()`): a truly unoccupied anchor
+  (`e === null && born === null`) is unlinked from the chain and removed from `byR`.
+  An occupied anchor, or a vacated birth home of a still-live moved element, is
+  NEVER unlinked. `doc.compact(V)` computes `minAck` and the quiescence predicate
+  ONCE and passes both to each collection's `_compact` (core-three ignores the
+  second arg -- signature-compatible, its bytes unchanged). A compacted anchor never
+  resurrects: replaying the full op log after compaction leaves the converged
+  sequence unchanged.
+- **`okState` list branch** + **`_retention()`** -- the incoming `kind:"list"` shape
+  is shape-validated (nodes/elems are plain objects) at the door; deep scalar
+  validation stays at USE inside `_mergeState` (the C-11 single-read / anti-TOCTOU
+  discipline, matching the map/set/counter branches). `_retention()` reflects
+  post-compaction reality (Tier-1 drops reduce `elems`, Tier-2 reduces `anchors`).
+
+### Added -- move (C5.3)
+
+- **`list.move(fromIndex, toIndex)`** -- move the live element at visible position
+  `fromIndex` to visible position `toIndex`, emitting one `lmv`. Both indices are
+  visible positions; an out-of-range or non-integer index fails closed
+  (`misconfigured`), symmetric with `insert`/`delete`. `toIndex` uses the
+  least-surprising array-move convention: it is the destination index AFTER the
+  element is removed -- `move(from, to)` is equivalent to
+  `arr.splice(to, 0, arr.splice(from, 1)[0])`. A self-move `move(i, i)` is a no-op
+  that still converges and leaves order intact. Returns `true`.
+- **`lmv` apply** -- MOVE is a first-class LWW POSITION REGISTER `(ml, mr) -> anchor`
+  whose value is drawn from the anchor space (NOT delete+reinsert, NOT a live-element
+  reference). `applyLmv` UNCONDITIONALLY mints + integrates a fresh anchor (whose id
+  is this move's own `(l, r)`) at the destination origin -- so a concurrent insert
+  that names this move's anchor as its origin still lands, win or lose -- then
+  CONDITIONALLY writes the element's register under `tsWins(l, r, e.ml, e.mr)`: only
+  a move that beats the element's current register stamp relinks the element to the
+  minted anchor (splice out of the old visible position, splice into the new). A
+  losing (lower-stamped) move leaves its minted anchor ABANDONED (occupying no
+  element, so it never inflates `count` or the projection). The element's initial
+  register stamp is its birth `(bl, br)`, and a move's lamport is always strictly
+  greater, so the first move always beats birth. Two concurrent moves of one element
+  thus converge to ONE position (the `tsWins` winner) on every replica. All scratch
+  fields are captured into stack locals before `ctx.changed()` (reentrancy
+  discipline). A redelivered move whose anchor already integrated early-returns with
+  zero allocation.
+- **Element record + identity** -- an element now OCCUPIES an anchor node (`node.e`)
+  and its birth node keeps a permanent `born` back-pointer, so the element stays
+  findable by its BIRTH identity `(bl, br)` after it migrates. `ids()`,
+  `delete(index)` and `deleteById` resolve the element by birth identity, not by its
+  current display anchor, so an id is stable across moves and a delete of a moved
+  element targets the right element.
+- **Move || delete commute** -- a move and a delete write DISJOINT fields (the
+  monotone `del` flag vs the LWW register), so they commute: a deleted element stays
+  invisible under any move and a move never resurrects it. All replicas converge to
+  the deleted (invisible) state regardless of arrival order.
+- **Born-moved placeholder** -- an `lmv` delivered before its birth `lins` records a
+  placeholder register keyed by the birth anchor (two-level `Map`, no string keys)
+  carrying the winning move stamp; the destination anchor is minted immediately. When
+  the birth `lins` integrates, the newborn is relinked to that anchor. An `lmv` whose
+  destination origin anchor is unseen pends on the shared origin buffer, exactly like
+  an `lins`. Both share the C5.1 `PENDING_MAX` (4096) budget and fail closed on
+  overflow.
+- **Door** -- `okOp` gains an `lmv` branch (single-read off `scratchOp`, C-18): `l`
+  finite `< 2^53`, `r` non-empty string, `bl` finite `< 2^53`, `br` non-empty string,
+  and `or === null` (HEAD) OR (`or` non-empty string AND `ol` finite `< 2^53`). A
+  malformed `lmv` is dropped-and-reported, never applied, never crashes.
+  `kindFromOpType` already maps `lmv -> "list"`.
+- **Tests** -- `test/23-list-move.test.mjs`: two concurrent moves converge to one
+  position (both delivery orders; losing anchor abandoned), move || delete commute,
+  sequential moves compose, self-move no-op, born-moved placeholder, a concurrent
+  insert naming a losing move's minted anchor still lands, `move` index validation,
+  a remote move of a deleted element is an invisible no-op, and a scaled mixed
+  `lins`/`ldel`/`lmv` reorder+duplication mini-fuzz. The classic RGA backward-typing
+  interleaving output is PINNED (a known RGA property, not a bug). Torture tiers T1
+  (degenerate) and T4 (door, incl. crafted BroadcastChannel frames) gain `lmv`
+  cross-product cases.
+
+### Added -- delete (C5.2)
+
+- **`list.delete(index)`** -- delete the live element at a visible position. An
+  out-of-range or non-integer index fails closed (`misconfigured`), symmetric with
+  `insert(index)`. Returns `true`.
+- **`list.deleteById(bl, br)`** -- delete the element whose birth anchor is
+  `(bl, br)`. A missing or already-deleted element is a no-op returning `false`
+  (consistent with OR-Set `deleteById` on a missing value); it emits nothing. A
+  live delete emits one `ldel` and returns `true`.
+- **`ldel` apply** -- a delete sets a MONOTONE per-element `del` flag (once true,
+  never false -- resurrection is unrepresentable) and splices the value out of the
+  projection; the birth ANCHOR node stays linked, so a concurrent `lins` that named
+  the deleted element as its origin still integrates in the right place. A duplicate
+  or re-delivered `ldel` on an already-deleted element early-returns with zero
+  allocation and no splice (the steady-state remote path); it only converges the
+  stored remover stamp `(dl, dr)` deterministically (higher `(l, r)` wins) so
+  concurrent deletes of one element agree on every replica. All scratch fields are
+  captured into stack locals before `ctx.changed()` (reentrancy discipline).
+- **Delete-before-insert placeholder** -- an `ldel` delivered before its birth
+  `lins` records a placeholder tombstone keyed by the birth anchor (two-level
+  `Map`, no string keys) carrying the remover stamp `(dl, dr)`; when the birth
+  `lins` finally integrates, the element is reconciled as BORN-DEAD (delete wins
+  over the late insert) on every replica, and its anchor is still linked. The
+  placeholder buffer shares the C5.1 `PENDING_MAX` (4096) budget and fails closed
+  on overflow (`malformed_state` report + drop); it dedups by birth identity, so a
+  re-delivered placeholder `ldel` consumes a slot only once.
+- **Door** -- `okOp` gains an `ldel` branch (single-read off `scratchOp`, C-18):
+  `l` finite `< 2^53`, `r` non-empty string, `bl` finite `< 2^53`, `br` non-empty
+  string. A malformed `ldel` is dropped-and-reported, never applied, never crashes.
+  `kindFromOpType` already maps `ldel -> "list"`. `lmv` (move) is still refused
+  (C5.3).
+
+### Added -- insert, identity, order (C5.1)
+
+- **`doc.list(name)`** -- a new `RGA` list collection alongside `map`/`array`/
+  `counter`. C5.1 surface: `insert(index, value)`, `values()`, `ids()` (per-element
+  birth-anchor id `"r#l"`, replica-independent), `size`, `snapshot()`, and a
+  read-only `.store` lite-store projection (writes/`push`/`splice` throw
+  `readonly`). Element identity is an immutable birth anchor `(l, r)`; position is
+  fixed at integration by the RGA scan (concurrent same-origin inserts descend by
+  `(lamport, replicaId)`), so order is deterministic and replica-independent.
+- **Out-of-order tolerance** -- an `lins` whose origin anchor is not yet integrated
+  is held in a capped (`4096`) pending buffer keyed by the origin anchor and drained
+  when that anchor arrives; it is never dropped. A buffer overflow (crafted-frame
+  DoS) fails closed with a `malformed_state` report and drop.
+- **Wire / door** -- new op types `lins`/`ldel`/`lmv`, all classified `"list"` by
+  `kindFromOpType`; `okOp` validates each frame single-read off `scratchOp` (C-18):
+  `l` finite `< 2^53`, `r` non-empty string; `lins`/`lmv` origin is `or === null`
+  (HEAD) OR a non-empty string with finite `ol < 2^53`; `ldel`/`lmv` birth is `bl`
+  finite `< 2^53` and `br` non-empty string. `scratchOp` gains `ol/or/bl/br`, copied
+  in `applyOp`'s single-read block. Zero allocation on the redelivered/steady-state
+  apply path.
+
+### Fixed (C5.5)
+
+- **Reentrant-dispose zombie collection** -- a `'change'` listener that called
+  `doc.dispose()` mid-`mergeState` left the OUTER multi-collection loop iterating
+  past disposal; the next collection name was recreated via `getCollection()` into
+  the just-cleared `cols` Map -- a live store/signal-holding zombie never passed to
+  `_dispose()` (a retention leak past disposal, all collection kinds). The loop now
+  re-checks `disposed` between collections and bails fail-closed. `test/26` asserts
+  no live collection survives a reentrant mid-merge dispose.
+- **Born-moved third occupancy guard** -- the born-moved reconciliation
+  (`dest.e = el`) was the one occupancy-write site without a co-occupant check. It
+  now fails closed symmetrically with the other two sites: a crafted state whose
+  born-moved anchor is already occupied by another element is reported to `onError`
+  and dropped, never clobbered. `test/26` asserts the crafted co-occupant is now
+  reported and preserved.
+
+### Proof gates (C5.5)
+
+- **T5 RGA oracle** (`test/torture/rga-oracle.mjs`) -- an INDEPENDENT reference RGA
+  (array-of-anchors + birth-keyed element map, re-derived from scratch, no linked
+  list, no pending buffer) drives a differential convergence fuzz: `24 x SCALE`
+  seeds x 5 replicas x 8 shuffled + duplicated + poison-injected deliveries, **0
+  divergences** from the oracle and across replays, idempotent, `validate` clean,
+  poison actually injected+rejected.
+- **T6 list alloc** -- 40000 REDELIVERED `lins`/`ldel`/`lmv` applies gate at
+  `maxMajor:0 / maxPauseMs:4 / maxArrayBuffersGrowth:0` with a structural
+  retention-delta of EXACTLY 0 and `pending === 0`. First-delivery insert is
+  measured separately (~242-252 B/op: one node + element + index entry + projection
+  slot, flat O(1)) against a calibrated 320 B/op regression ceiling, excluded from
+  the 0-B claim.
+- **T7 retention/compaction soak** -- 20000-op churn over 64 live ids; a
+  quiescence-compacted doc reclaims to the confirmed `anchors <= size + 1 + U` bound
+  (U = still-live moved-element birth homes + origin-referenced anchors) with the
+  unjustified-tombstone census driven to 0 at the compaction fixpoint, while the
+  never-compacted control grows O(ops); byte-identical render, no resurrection on
+  full replay.
+- **T9 five RGA controls** -- ascending-tie order, move-without-`tsWins`, drop-vs-
+  pend unknown origin, unsound anchor unlink (origin-leaf/quiescence), and an
+  allocating apply path each fire-and-catch (the tier `die()`s on a broken variant).
+- **Golden core-three fixture** -- `test/fixtures/golden-core-three.json` captures
+  `getState()` from an actual v1.3.1 build over a frozen 24-seed corpus;
+  `test/27-golden-core-three.test.mjs` asserts the 2.0 `getState()` is byte-
+  identical, and the POISON corpus is rejected with the frozen door verdict.
+
 ## [1.3.1] - 2026-09-02
 
 One S2 misconfiguration finding (`decisions/0005-local-replica-id-validation.md`),

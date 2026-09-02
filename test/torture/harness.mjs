@@ -93,9 +93,18 @@ export function validate(doc) {
     if (typeof clock !== "number" || !Number.isFinite(clock)) {
         throw new Error("validate: clock is not a finite number: " + clock);
     }
+    // List collections carry a live linked chain that getState() does not expose
+    // in C5.1, so their structural invariant is checked off the collection's own
+    // _validate() below -- skip them in the getState() sweep.
+    if (typeof doc._cols === "function") {
+        for (const col of doc._cols()) {
+            if (col.kind === "list" && typeof col._validate === "function") col._validate(clock);
+        }
+    }
     const st = doc.getState();
     for (const name in st.cols) {
         const c = st.cols[name];
+        if (c.kind === "list") continue;
         if (c.kind === "map") {
             for (const k in c.entries) {
                 const e = c.entries[k]; // [l, r, del] or [l, r, 0, v]

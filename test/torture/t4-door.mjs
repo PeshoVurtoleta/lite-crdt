@@ -57,6 +57,36 @@ const CASES = [
         poison: (x) => x.applyOp({ t: "set", c: "m", k: "x", l: 2 ** 53, r: "peer", v: "remote" }),
         after: (x) => { x.map("m").set("y", "a"); },
     },
+    {
+        // RGA `ldel` door: a non-finite `l`, an empty `br`, a non-finite `bl` and a
+        // ceiling `l` are each dropped-and-reported; a legitimate later delete still
+        // lands, so the poisoned run reaches the same converged list as the clean one.
+        name: "list ldel with degenerate l / br / bl is dropped",
+        good: (x) => { x.list("seq").insert(0, "a"); x.list("seq").insert(1, "b"); }, // births (1,"R"),(2,"R")
+        poison: (x) => {
+            x.applyOp({ t: "ldel", c: "seq", l: Infinity, r: "peer", bl: 1, br: "R" }); // bad l
+            x.applyOp({ t: "ldel", c: "seq", l: 9, r: "peer", bl: 1, br: "" });          // empty br
+            x.applyOp({ t: "ldel", c: "seq", l: 9, r: "peer", bl: NaN, br: "R" });       // bad bl
+            x.applyOp({ t: "ldel", c: "seq", l: 2 ** 53, r: "peer", bl: 1, br: "R" });   // ceiling l
+        },
+        after: (x) => { x.list("seq").delete(0); }, // legitimately delete "a" -> ["b"]
+    },
+    {
+        // RGA `lmv` door: a non-finite `l`, an empty `br`, a non-finite `bl`, a
+        // non-string `or` and a ceiling `l` are each dropped-and-reported; a
+        // legitimate later move still lands, so the poisoned run reaches the same
+        // converged list as the clean one.
+        name: "list lmv with degenerate l / br / bl / or is dropped",
+        good: (x) => { x.list("seq").insert(0, "a"); x.list("seq").insert(1, "b"); }, // births (1,"R"),(2,"R")
+        poison: (x) => {
+            x.applyOp({ t: "lmv", c: "seq", l: Infinity, r: "peer", bl: 1, br: "R", or: null }); // bad l
+            x.applyOp({ t: "lmv", c: "seq", l: 9, r: "peer", bl: 1, br: "", or: null });          // empty br
+            x.applyOp({ t: "lmv", c: "seq", l: 9, r: "peer", bl: NaN, br: "R", or: null });        // bad bl
+            x.applyOp({ t: "lmv", c: "seq", l: 9, r: "peer", bl: 1, br: "R", or: 5, ol: 1 });      // non-string or
+            x.applyOp({ t: "lmv", c: "seq", l: 2 ** 53, r: "peer", bl: 1, br: "R", or: null });    // ceiling l
+        },
+        after: (x) => { x.list("seq").move(1, 0); }, // legitimately move "b" before "a" -> ["b","a"]
+    },
 ];
 
 export function run() {
@@ -227,6 +257,78 @@ export function run() {
     }
 
     checkBroadcastGuard();
+    checkListPlaceholderFlood();
+    checkListMovePlaceholderFlood();
+}
+
+// The delete-before-insert placeholder buffer is an unbounded-growth DoS surface
+// (a crafted `ldel` naming a birth that never arrives): it MUST cap at PENDING_MAX
+// and fail closed, exactly like the origin buffer, and a re-delivered placeholder
+// for an already-tombstoned birth must NOT consume a second slot (dedup by birth).
+function checkListPlaceholderFlood() {
+    const errs = [];
+    const d = createCRDTDoc({ replicaId: "LPF", onError: (e) => errs.push(e) });
+    const l = d.list("seq");
+    const PENDING_MAX = 4096;
+    const FLOOD = PENDING_MAX + 64;
+    for (let i = 0; i < FLOOD; i++) {
+        // Each ldel names a distinct, never-arriving birth -- a crafted-frame flood.
+        check(!throws(() => d.applyOp({ t: "ldel", c: "seq", l: 1000 + i, r: "att" + i, bl: i, br: "ghost" + i })),
+            () => "T4: a placeholder ldel flood frame threw out of applyOp");
+    }
+    check(l.size === 0, () => "T4: a fictional-birth ldel must delete nothing (size " + l.size + ")");
+    check(l._retention().pending === PENDING_MAX, () => "T4: the delete placeholder buffer must cap at PENDING_MAX (" + l._retention().pending + ")");
+    check(errs.length >= 60, () => "T4: overflow placeholder ldels past the cap must be reported (" + errs.length + ")");
+    validate(d);
+    // A re-delivered placeholder for an already-tombstoned birth must not grow the buffer.
+    const before = l._retention().pending;
+    d.applyOp({ t: "ldel", c: "seq", l: 1, r: "att0", bl: 0, br: "ghost0" });
+    check(l._retention().pending === before, () => "T4: a re-delivered placeholder ldel consumed a new slot (dedup by birth broken)");
+    // The doc stays fully usable after the flood.
+    check(!throws(() => l.insert(0, "good-local")), () => "T4: a local insert after the placeholder flood threw");
+    check(l.size === 1, () => "T4: a genuine insert after the placeholder flood did not apply");
+    validate(d);
+    d.dispose();
+}
+
+// The born-moved placeholder buffer (mvPending) is the MOVE-side twin of the
+// delete-before-insert buffer above -- a crafted `lmv` naming a birth that never
+// arrives -- and must fail closed identically: cap at PENDING_MAX (shared budget
+// with the origin + delete placeholder buffers), report every overflow, and never
+// grow unbounded. Symmetric with checkListPlaceholderFlood (the reviewer's nit):
+// that check only floods delPending via `ldel`; this one drives mvPending itself
+// to overflow via `lmv`, so move-side DoS coverage is not a blind spot.
+function checkListMovePlaceholderFlood() {
+    const errs = [];
+    const d = createCRDTDoc({ replicaId: "MPF", onError: (e) => errs.push(e) });
+    const l = d.list("seq");
+    const PENDING_MAX = 4096;
+    const FLOOD = PENDING_MAX + 64;
+    for (let i = 0; i < FLOOD; i++) {
+        // Each lmv names a distinct, never-arriving birth (bl=i, br="ghost"+i) with
+        // a HEAD origin (or:null) so step 1 (unconditional mint) always resolves
+        // immediately -- only the born-moved registration (step 2, markMvPending)
+        // is what must fail closed once the shared pendingCount budget is spent.
+        check(!throws(() => d.applyOp({ t: "lmv", c: "seq", l: 1000 + i, r: "att" + i, bl: i, br: "ghost" + i, or: null, ol: undefined })),
+            () => "T4: a born-moved lmv flood frame threw out of applyOp");
+    }
+    check(l.size === 0, () => "T4: a fictional-birth lmv must move nothing into visibility (size " + l.size + ")");
+    check(l._retention().pending === PENDING_MAX, () => "T4: the move placeholder buffer must cap at PENDING_MAX (" + l._retention().pending + ")");
+    check(errs.length >= 60, () => "T4: overflow born-moved lmvs past the cap must be reported (" + errs.length + ")");
+    validate(d);
+    // A re-delivered born-moved placeholder for an already-registered birth must
+    // not grow the buffer (dedup by birth identity, exactly like delPending).
+    const before = l._retention().pending;
+    d.applyOp({ t: "lmv", c: "seq", l: 1, r: "att0", bl: 0, br: "ghost0", or: null, ol: undefined });
+    check(l._retention().pending === before, () => "T4: a re-delivered born-moved lmv consumed a new slot (dedup by birth broken)");
+    // The doc stays fully usable after the flood: a genuine local insert still
+    // applies, and the birth-anchor mint from the flood (unconditional, step 1)
+    // left FLOOD abandoned anchors linked -- the structural chain must still be
+    // sound (validate() above already proved this holds mid-flood too).
+    check(!throws(() => l.insert(0, "good-local")), () => "T4: a local insert after the move-placeholder flood threw");
+    check(l.size === 1, () => "T4: a genuine insert after the move-placeholder flood did not apply");
+    validate(d);
+    d.dispose();
 }
 
 function throws(fn) {
@@ -265,6 +367,12 @@ function checkBroadcastGuard() {
             { t: "state", from: "peer", state: null },                                              // null state
             { t: "state", from: "peer", state: 42 },                                                // non-object state
             { t: "op", from: "peer", op: null },                                                    // null single op
+            { t: "ops", from: "peer", ops: [{ t: "ldel", c: "seq", l: Infinity, r: "p", bl: 1, br: "A" }] }, // crafted ldel: bad l
+            { t: "ops", from: "peer", ops: [{ t: "ldel", c: "seq", l: 5, r: "p", bl: NaN, br: "A" }] },      // crafted ldel: bad bl
+            { t: "op", from: "peer", op: { t: "ldel", c: "seq", l: 5, r: "p", bl: 1, br: "" } },              // crafted ldel: empty br
+            { t: "ops", from: "peer", ops: [{ t: "lmv", c: "seq", l: Infinity, r: "p", bl: 1, br: "A", or: null }] }, // crafted lmv: bad l
+            { t: "ops", from: "peer", ops: [{ t: "lmv", c: "seq", l: 5, r: "p", bl: NaN, br: "A", or: null }] },       // crafted lmv: bad bl
+            { t: "op", from: "peer", op: { t: "lmv", c: "seq", l: 5, r: "p", bl: 1, br: "A", or: 5, ol: 1 } },          // crafted lmv: non-string or
         ];
         for (const data of crafted) {
             let threw = false;

@@ -1,5 +1,5 @@
 /**
- * @zakkster/lite-crdt v1.2.0
+ * @zakkster/lite-crdt v1.2.1
  * --------------------------
  * Operational CRDTs for @zakkster/lite-store. Two convergent data types backed
  * by signal-reactive projections:
@@ -43,7 +43,7 @@ import { signal, dispose as disposeSignal, batch } from "@zakkster/lite-signal";
  * writing through a read-only projection, or a missing element id.
  */
 /** Package version. Kept in three-place sync with package.json and CHANGELOG.md. */
-export const VERSION = "1.2.0";
+export const VERSION = "1.2.1";
 
 export class CRDTError extends Error {
     constructor(code, message, opts) {
@@ -55,11 +55,46 @@ export class CRDTError extends Error {
 
 /* ─── Helpers ─────────────────────────────────────────────────────────────── */
 
-/** Generate a reasonably-unique replica id when the caller does not supply one. */
+/**
+ * The Web Crypto source, resolved ONCE at module load so genReplicaId stays a
+ * synchronous read of a module-scope const. Resolution order:
+ *   1. the Web Crypto global -- present unflagged in browsers and Node >= 19;
+ *   2. the `node:crypto` `webcrypto` builtin -- the fallback for Node 18.x LTS,
+ *      whose default runtime does NOT expose the unflagged `globalThis.crypto`
+ *      (it landed in Node 19.0.0). A Node builtin is not a runtime dependency.
+ * A browser has no `node:crypto`; the dynamic import rejects and is caught, so
+ * step 1 stands. `webcrypto` exposes both `randomUUID` and `getRandomValues`.
+ * This introduces top-level await -- valid ESM; every consumer imports the graph
+ * (no CJS/require load of this file exists in the repo).
+ */
+let CRYPTO = globalThis.crypto && typeof globalThis.crypto.randomUUID === "function"
+    ? globalThis.crypto : null;
+if (!CRYPTO && globalThis.process && globalThis.process.versions && globalThis.process.versions.node) {
+    try { CRYPTO = (await import("node:crypto")).webcrypto; } catch { CRYPTO = null; }
+}
+
+/**
+ * Generate a globally-unique replica id when the caller does not supply one.
+ * COLD: runs once per createCRDTDoc, never on any apply/emit/add/rm hot path.
+ * Fails closed -- absence of ANY crypto source (no Web Crypto global AND no
+ * node:crypto, i.e. a genuinely crypto-less realm) is a misconfiguration, not a
+ * licence to fall back to weak, collidable Math.random entropy. Both live paths
+ * yield a 34-char id ("r-" + 32 hex). See decisions/0003 (C-14).
+ */
 function genReplicaId() {
-    const c = globalThis.crypto;
-    if (c && typeof c.randomUUID === "function") return "r-" + c.randomUUID().slice(0, 8);
-    return "r-" + Math.random().toString(36).slice(2, 10);
+    if (CRYPTO) {
+        if (typeof CRYPTO.randomUUID === "function") return "r-" + CRYPTO.randomUUID().replace(/-/g, ""); // 122-bit UUIDv4 -> 32 hex
+        if (typeof CRYPTO.getRandomValues === "function") {                                              // 128-bit fallback
+            const b = CRYPTO.getRandomValues(new Uint8Array(16));
+            let s = "r-";
+            for (let i = 0; i < 16; i++) s += b[i].toString(16).padStart(2, "0");
+            return s;
+        }
+    }
+    throw new CRDTError(
+        "misconfigured",
+        "no crypto source (Web Crypto global or node:crypto) to mint a replica id; supply an explicit, globally-unique `replicaId` option."
+    );
 }
 
 /**

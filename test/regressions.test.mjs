@@ -362,3 +362,28 @@ test("C-12: a __proto__ replicaId on a PN-Counter round-trips getState -> mergeS
     b.dispose();
     merged.dispose();
 });
+
+test("C-13: undo of an OR-Set removal restores membership + value, NOT list position (contract, decisions/0003)", () => {
+    // This test ENCODES the decided contract (option (a)). A future change to
+    // undo ordering must break THIS test, not silently alter behaviour.
+    const d = createCRDTDoc({ replicaId: "A" });
+    const a = d.array("L");
+    a.add({ id: "1", v: "one" });
+    a.add({ id: "2", v: "two" });
+    assert.deepEqual(a.values().map((v) => v.id), ["1", "2"], "initial insertion order");
+    a.deleteById("1");
+    assert.equal(a.hasId("1"), false, "id 1 removed");
+    d.undo();
+    // Membership {1,2} is restored...
+    assert.equal(a.size, 2, "both ids live after undo");
+    assert.equal(a.hasId("1"), true, "membership of id 1 restored");
+    assert.equal(a.hasId("2"), true, "id 2 still live");
+    // ...value is restored...
+    assert.equal(a.get("1").v, "one", "value of id 1 restored");
+    assert.equal(a.get("2").v, "two", "value of id 2 unchanged");
+    // ...but POSITION is NOT: undo mints a fresh tag, so id 1 reappears LAST,
+    // re-timed after id 2. The order is [2, 1], not the original [1, 2].
+    assert.deepEqual(a.values().map((v) => v.id), ["2", "1"],
+        "undo re-times element order: id 1 reappears last (fresh tag / new order key)");
+    d.dispose();
+});

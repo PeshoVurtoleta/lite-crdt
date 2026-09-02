@@ -76,4 +76,34 @@ export function run() {
     check(r.valueReg <= ID_COUNT, () => `T7: valueReg grew to ${r.valueReg} over ${ID_COUNT} ids (should be one register per distinct id)`);
     validate(rd);
     rd.dispose();
+
+    // C-14 re-baseline: the WIDENED auto-minted replicaId (34 chars: "r-" + 32
+    // hex) lengthens every tagKey (`replicaId + "#" + n`) it stamps. Re-run the
+    // retention soak on a doc created WITHOUT a caller replicaId so the wider id
+    // genuinely feeds the tag path, and confirm the retention bound is
+    // WIDTH-INDEPENDENT: `adds` is still O(live ids), never O(cycles), no matter
+    // how long the id is. The RETAIN soak above uses a short caller id ("RETAIN");
+    // this one proves the wider default does not change the invariant.
+    const wd = createCRDTDoc();                 // auto-mint the id
+    // OLD id width was ~10 chars ("r-" + 8 hex), tagKey ~ 12 bytes; NEW id width
+    // is 34 chars, tagKey ~ 36 bytes. Pin the NEW width so a silent narrowing of
+    // genReplicaId (a uniqueness regression) fails here.
+    const ID_WIDTH = 34;
+    check(wd.replicaId.length === ID_WIDTH, () => `T7: auto-minted replicaId width is ${wd.replicaId.length}, expected ${ID_WIDTH} (genReplicaId narrowed -- uniqueness regression)`);
+    const warr = wd.array("wbag");
+    const wprng = makePrng(SEED ^ 0x71d7);
+    for (let i = 0; i < RETAIN_CYCLES; i++) {
+        const id = "id" + (Math.floor(frac(wprng) * ID_COUNT));
+        warr.add({ id, v: i });
+        if (frac(wprng) < 0.75) warr.deleteById(id);
+    }
+    const wr = warr._retention();
+    check(wr.adds === warr.size, () => `T7: (wide id) adds holds ${wr.adds} entries but ${warr.size} ids are live (${wr.adds - warr.size} dead empty entries -- C-10 leak)`);
+    check(wr.adds <= ID_COUNT, () => `T7: (wide id) adds grew to ${wr.adds} over ${ID_COUNT} ids after ${RETAIN_CYCLES} cycles (retention not O(live ids) -- width leaked into growth)`);
+    // Every live tagKey is exactly one id-width + "#" + a decimal counter, so the
+    // per-tag byte cost is bounded by the id width, not the cycle count. The
+    // widened id costs ~24 extra bytes PER LIVE TAG (a memory cost), never a
+    // per-op allocation (T6 proves apply stays zero-alloc).
+    validate(wd);
+    wd.dispose();
 }

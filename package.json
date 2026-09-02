@@ -1,6 +1,6 @@
 {
   "name": "@zakkster/lite-crdt",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Operational CRDTs for @zakkster/lite-store: an LWW-Map and an observed-remove OR-Set (plus a PN-Counter) whose converged state is projected into a reactive lite-store. Op-based, transport-agnostic, order-independent and duplicate-tolerant, with full-state sync and an optional cross-tab BroadcastChannel transport. Single-file ESM, zero runtime dependencies beyond the lite-store/lite-signal reactive core.",
   "keywords": [
     "crdt",

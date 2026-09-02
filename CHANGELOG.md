@@ -4,6 +4,46 @@ All notable changes to `@zakkster/lite-crdt` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-09-02
+
+Two S3 contract findings (`decisions/0003-undo-and-replica-identity.md`). The
+convergence algebra does NOT change, the wire format does NOT change (replica
+ids are opaque to the wire -- a wider id serializes as an ordinary string and
+round-trips byte-compatibly), and the remote-op door (C1) and C2 serialization /
+retention work are untouched. Only one cold helper (`genReplicaId`) changes; the
+undo, apply, add, rm and tick hot bodies gain zero branches and zero bytes.
+
+### Changed
+
+- **C-14** `genReplicaId()` entropy widened and made fail-closed. The
+  auto-generated `replicaId` now comes from a crypto source resolved once at
+  module load -- the Web Crypto global (browsers, Node >= 19) or the
+  `node:crypto` `webcrypto` builtin (Node 18.x, whose default runtime lacks the
+  unflagged `globalThis.crypto`; a Node builtin, not a runtime dep) -- using
+  primary `randomUUID()` (122-bit, dashes stripped) or a 128-bit
+  `getRandomValues(new Uint8Array(16))` fallback, both a 34-char `"r-..."` id.
+  The old 32-bit `randomUUID().slice(0, 8)` primary and the weak `Math.random()`
+  fallback are DELETED: only in a realm with NEITHER crypto source does
+  `createCRDTDoc` throw `CRDTError("misconfigured")` rather than mint a collidable
+  id -- a genuine last resort, not the common case, so `engines.node >= 18`
+  holds. `genReplicaId` runs once per doc creation and is not on any hot path.
+  Note: this makes CRDT.js use top-level await at module load (valid ESM; the
+  repo has no CJS/`require` load of it).
+
+### Documented
+
+- **C-13** undo of an OR-Set removal restores MEMBERSHIP and VALUE, not list
+  position: undo emits a fresh `add` op, so the element reappears at a re-timed
+  index. This is now a written CONTRACT (option (a)); restoring position via a
+  verbatim-tag re-add (option (b)) is rejected as UNSOUND -- `apply` discards an
+  already-tombstoned tag (`CRDT.js` `if (!removed.has(tagKey))`), so (b) would
+  require un-tombstoning it and would diverge permanently from any peer still
+  holding that tombstone. Pinned by a regression test; no code change.
+- **C-14** the replica-uniqueness + monotonic-lamport assumption the
+  `(lamport, replicaId)` total order (and every OR-Set `replicaId + "#" + n` tag)
+  rests on, plus the computed collision probability of the widened id, are
+  recorded in `decisions/0003` and `llms.txt`.
+
 ## [1.2.0] - 2026-09-02
 
 Three orthogonal hygiene fixes on the OR-Set and the cold serialization surface

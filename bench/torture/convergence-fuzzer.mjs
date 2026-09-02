@@ -12,7 +12,10 @@
  *     forwarding those frames to a peer converges it.
  *   - UNDO/REDO    a random interleaving of local edits, undo and redo, each step
  *     checked against a reference history stack of snapshots (OR-Set compared by
- *     membership/value; undo re-add legitimately re-times element order).
+ *     membership/value; undo re-add re-times element order -- this is the CONTRACT,
+ *     not a defect: undo emits a fresh `add` op, so position is not restored but
+ *     membership + value are. See decisions/0003-undo-and-replica-identity.md, C-13,
+ *     for why restoring position (verbatim-tag re-add) is unsound under add-wins).
  *
  * Exit code: 0 on clean run, 1 on any assertion failure.
  * Usage: node bench/torture/convergence-fuzzer.mjs        (TORTURE_SCALE=10 to crank)
